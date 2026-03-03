@@ -13,7 +13,7 @@ import numpy as np
 from typing import Tuple, Optional, Dict, Any
 import matplotlib.pyplot as plt
 
-from radar_lidar_fusion_losses import (
+from losses import (
     FocalLoss, QuantileLoss, ChamferDistance, 
     ConsistencyLoss, RadarLidarLoss
 )
