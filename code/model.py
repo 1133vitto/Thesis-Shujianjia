@@ -73,7 +73,7 @@ class FastFusionModel(nn.Module):
         # 一行代码搞定原版近 100 行的代码！
         self.unet = smp.Unet(
             encoder_name="resnet18",      # 使用轻量级的 resnet18 作为主干提取特征
-            encoder_weights=None,         # 因为是雷达数据不是普通照片，不需要预训练权重
+            encoder_weights="imagenet",         
             in_channels=cnn_out_channels, # 输入通道数等于编码器的输出
             # 输出通道数 = 1个占据栅格预测(Occupancy) + 3个分位数预测(Quantiles)
             classes=1 + num_quantiles     

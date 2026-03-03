@@ -206,10 +206,10 @@ def main():
                 quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
 
                 loss_dict = criterion(
-                    occupancy_logits=outputs['occupancy_logits'], 
-                    quantile_preds=outputs['quantiles'],
-                    occupancy_target=occupancy_target,
-                    radar_energy=outputs['ra_energy']
+                occupancy_logits=occupancy_logits, 
+                quantile_preds=quantile_preds,
+                occupancy_target=occupancy_target,
+                radar_energy=radar_energy
                 )
                 total_val_loss += loss_dict['total_loss'].item()
                 
