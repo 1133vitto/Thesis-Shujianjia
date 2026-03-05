@@ -107,16 +107,16 @@ def main():
         from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
         from radelft.data_preparation import data_preparation
         params = data_preparation.get_default_params()
-        params["dataset_path"] = 'F:/radelft/Scene1_RadarCubes/'
-        params["train_val_scenes"] = [1]
-        params["test_scenes"] = [1]
+        params["dataset_path"] = '/scratch/shujianjia/dataset/'
+        params["train_val_scenes"] = [1,3,4,5,7]
+        params["test_scenes"] = [2,6]
         train_dataset = RaDelftWrapper(mode='train', params=params)
         val_dataset = RaDelftWrapper(mode='val', params=params)
     # else:
     #     train_dataset = SafeMockDataset(num_samples=200, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
     #     val_dataset = SafeMockDataset(num_samples=40, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4 if args.device=='cuda' else 0)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=32 if args.device=='cuda' else 0)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
     # 2. 初始化极简融合模型
@@ -194,6 +194,9 @@ def main():
         total_val_loss = 0.0
         pd_list = []
         pfa_list = []
+        qpd_list = []
+        qpfa_list = []
+        count=0
         with torch.no_grad():
             for batch_data in val_loader:
                 radar_cube = batch_data['radar_cube'].to(args.device)
@@ -208,6 +211,7 @@ def main():
                 occupancy_logits = outputs['occupancy_logits'][:, :-12, 8:-8]
                 radar_energy = outputs['ra_energy'][:, :-12, 8:-8]
                 quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
+                qback_est=outputs['background_est'][:, :-12, 8:-8, :]
 
                 loss_dict = criterion(
                 occupancy_logits=occupancy_logits, 
@@ -233,13 +237,21 @@ def main():
                 local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
                 alpha=1.0
                 final_pred_2d = radar_energy > (alpha * local_bg_noise_mean)
+                qpred=radar_energy > qback_est
 
+                qpred=qpred.cpu().detach().numpy()
                 gt_numpy=occupancy_target.cpu().detach().numpy()
                 final_pred_2d=final_pred_2d.cpu().detach().numpy()
                 pd, pfa = compute_pd_pfa(gt_numpy, final_pred_2d)
-                print(f" Pd: {pd:.4f} |  Pfa: {pfa:.4f}")
+                qpd ,qpfa= compute_pd_pfa(gt_numpy, qpred)
+                if count%10=0
+                    print(f" Pd: {pd:.4f} |  Pfa: {pfa:.4f} /n Quantile Pd: {qpd:.4f} |  Pfa: {qpfa:.4f}")
                 pd_list.append(pd)
                 pfa_list.append(pfa)
+                qpd_list.append(qpd)
+                qpfa_list.append(qpfa)
+                count=count+1
+
 
 
 
@@ -252,7 +264,9 @@ def main():
         avg_val_loss = total_val_loss / len(val_loader)
         mean_pd = np.mean(pd_list)
         mean_pfa = np.mean(pfa_list)
-        print(f"\n[Validation Result] -> Average Pd: {mean_pd:.4f} | Average Pfa: {mean_pfa:.4f}")
+        mean_qpd = np.mean(qpd_list)
+        mean_qpfa = np.mean(qpfa_list)
+        print(f"\n[Validation Result] -> Average Pd: {mean_pd:.4f} | Average Pfa: {mean_pfa:.4f} Average QPd: {mean_qpd:.4f} | Average QPfa: {mean_qpfa:.4f}")
         print(f"👉 Epoch [{epoch+1}] Summary | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         
         # 保存最佳模型
