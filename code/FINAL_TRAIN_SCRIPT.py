@@ -211,7 +211,7 @@ def main():
                 occupancy_logits = outputs['occupancy_logits'][:, :-12, 8:-8]
                 radar_energy = outputs['ra_energy'][:, :-12, 8:-8]
                 quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
-                qback_est=outputs['background_est'][:, :-12, 8:-8, :]
+                qback_est=outputs['background_est'][:, :-12, 8:-8]
 
                 loss_dict = criterion(
                 occupancy_logits=occupancy_logits, 
@@ -244,7 +244,7 @@ def main():
                 final_pred_2d=final_pred_2d.cpu().detach().numpy()
                 pd, pfa = compute_pd_pfa(gt_numpy, final_pred_2d)
                 qpd ,qpfa= compute_pd_pfa(gt_numpy, qpred)
-                if count%10=0
+                if count%10==0:
                     print(f" Pd: {pd:.4f} |  Pfa: {pfa:.4f} /n Quantile Pd: {qpd:.4f} |  Pfa: {qpfa:.4f}")
                 pd_list.append(pd)
                 pfa_list.append(pfa)
