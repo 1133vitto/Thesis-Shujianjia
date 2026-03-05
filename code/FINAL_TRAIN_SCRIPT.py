@@ -5,7 +5,7 @@
 import sys
 import os
 from pathlib import Path
-
+import torch.nn.functional as F
 current_dir = Path(__file__).resolve().parent
 radelft_dir = current_dir / "radelft"
 sys.path.insert(0, str(radelft_dir)) # 插到最前面，拥有最高优先级
@@ -17,6 +17,8 @@ import numpy as np
 import os
 import argparse
 from tqdm import tqdm  # 进度条神器
+from radelft.utils.compute_metrics import compute_metrics_time, compute_pd_pfa
+
 
 # 导入我们刚刚重构的核心利器
 from model import FastFusionModel
@@ -75,7 +77,7 @@ class RaDelftWrapper(Dataset):
 # 训练主函数
 # ==========================================
 def main():
-    parser = argparse.ArgumentParser(description='雷达-LiDAR 融合检测训练脚本')
+    parser = argparse.ArgumentParser(description='训练脚本')
     parser.add_argument('--use_radelft', default=True ,action='store_true', help='使用真实的 RaDelft 数据集')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_epochs', type=int, default=50)
@@ -100,7 +102,7 @@ def main():
     
     # 1. 准备数据
     if args.use_radelft:
-        # 这里保留你真实的 RaDelft 加载逻辑
+        # RaDelft
         # 请确保 RaDelft dataset 返回的字典里有 'radar_cube' 和 'occupancy_target' 这两个 key
         from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
         from radelft.data_preparation import data_preparation
@@ -120,7 +122,7 @@ def main():
     # 2. 初始化极简融合模型
     model = FastFusionModel(
         angle_bins=args.angle_bins,
-        cnn_out_channels=64
+        doppler_channels=128
     ).to(args.device)
     
     # 3. 初始化物理严谨的融合 Loss
@@ -190,6 +192,8 @@ def main():
         # 6. 验证循环
         model.eval()
         total_val_loss = 0.0
+        pd_list = []
+        pfa_list = []
         with torch.no_grad():
             for batch_data in val_loader:
                 radar_cube = batch_data['radar_cube'].to(args.device)
@@ -212,8 +216,43 @@ def main():
                 radar_energy=radar_energy
                 )
                 total_val_loss += loss_dict['total_loss'].item()
+
+                # gtcube=occupancy_target.cpu().detach().numpy()
+                # occupancy_logits=occupancy_logits.cpu().detach().numpy()
+                # radar_energy=radar_energy.cpu().detach().numpy()
+                pred=1.0-occupancy_logits
+                bgenergy=pred*radar_energy
+
+                kernel_size = 5
+                pad = kernel_size // 2
+            
+                # 使用平均池化计算局部背景均值
+                local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
+                local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
+
+                local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
+                alpha=1.0
+                final_pred_2d = radar_energy > (alpha * local_bg_noise_mean)
+
+                gt_numpy=occupancy_target.cpu().detach().numpy()
+                final_pred_2d=final_pred_2d.cpu().detach().numpy()
+                pd, pfa = compute_pd_pfa(gt_numpy, final_pred_2d)
+                print(f" Pd: {pd:.4f} |  Pfa: {pfa:.4f}")
+                pd_list.append(pd)
+                pfa_list.append(pfa)
+
+
+
                 
+
+
+
+
+
         avg_val_loss = total_val_loss / len(val_loader)
+        mean_pd = np.mean(pd_list)
+        mean_pfa = np.mean(pfa_list)
+        print(f"\n[Validation Result] -> Average Pd: {mean_pd:.4f} | Average Pfa: {mean_pfa:.4f}")
         print(f"👉 Epoch [{epoch+1}] Summary | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         
         # 保存最佳模型

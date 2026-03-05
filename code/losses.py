@@ -102,10 +102,10 @@ class RadarFusionLoss(nn.Module):
         self.quantile_loss = MaskedQuantileLoss(quantiles=quantiles)
 
     def forward(self, 
-                occupancy_logits: torch.Tensor,   # 注意：传进来的是 U-Net 没过 sigmoid 的原始输出
-                quantile_preds: torch.Tensor,     # U-Net 预测的背景底噪
-                occupancy_target: torch.Tensor,   # LiDAR 真值地图
-                radar_energy: torch.Tensor        # 雷达原始能量图
+                occupancy_logits: torch.Tensor,   #  U-Net 没过 sigmoid 的原始输出
+                quantile_preds: torch.Tensor,     # U-Net 预测的分位数
+                occupancy_target: torch.Tensor,   # LiDAR gt
+                radar_energy: torch.Tensor        # radar original
                 ) -> dict:
         
         # 1. 算检测 Loss（找目标）
