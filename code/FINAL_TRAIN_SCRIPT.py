@@ -4,6 +4,7 @@
 """
 import sys
 import os
+import datetime
 from pathlib import Path
 import torch.nn.functional as F
 current_dir = Path(__file__).resolve().parent
@@ -56,10 +57,12 @@ class RaDelftWrapper(Dataset):
         # 此时 input_cube 形状是 (2, 128, 512, 256) -> (Channel, Doppler, Range, Azimuth)
         # 索引 0 就是 Power
         power_cube = input_cube[0] # 形状变成 (128, 512, 256)
+        elevation_cube = input_cube[1] # (128, 512, 256) 
         
         # 2. 修复维度顺序
         # 我们的模型需要 (Range, Doppler, Azimuth)，所以把第0维和第1维换一下
         power_cube = np.transpose(power_cube, (1, 0, 2)) # 形状完美变成 (512, 128, 256)
+        elevation_cube = np.transpose(elevation_cube, (1, 0, 2))
         
         # 3. 处理真值 (确保是 2D 的 Range x Azimuth)
         # 有时候 gt_cube 可能会带一个通道维度，比如 (1, 512, 256)，我们用 squeeze 把多余的 1 挤掉
@@ -68,6 +71,7 @@ class RaDelftWrapper(Dataset):
         # 4. 组装成我们 Loss 和 Model 需要的字典格式
         return {
             'radar_cube': torch.from_numpy(power_cube).float(),
+            'elevation_cube': torch.from_numpy(elevation_cube).float(),
             'occupancy_target': torch.from_numpy(occupancy_target).float()
         }
 
@@ -97,8 +101,13 @@ def main():
     print(f"🖥️  运算设备: {args.device}")
     print(f"📂 数据模式: {'RaDelft 真实数据' if args.use_radelft else '本地安全模拟数据'}")
     print("="*70)
-    
-    os.makedirs(args.save_dir, exist_ok=True)
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"run_{current_time}"
+    # 例如：./checkpoints/run_20240516_143000
+    save_dir = os.path.join(args.save_dir, run_name) 
+    os.makedirs(save_dir, exist_ok=True)
+    print(f"📁 本次训练的所有权重将保存在: {save_dir}")
+    # os.makedirs(args.save_dir, exist_ok=True)
     
     # 1. 准备数据
     if args.use_radelft:
@@ -126,7 +135,7 @@ def main():
     ).to(args.device)
     
     # 3. 初始化物理严谨的融合 Loss
-    criterion = RadarFusionLoss(weight_focal=1.0, weight_quantile=0.5)
+    criterion = RadarFusionLoss(weight_focal=1.0)
     
     # 4. 优化器
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4) # AdamW 比 Adam 更利于泛化
@@ -158,14 +167,14 @@ def main():
             outputs = model(radar_cube)
             occupancy_logits = outputs['occupancy_logits'][:, :-12, 8:-8]
             radar_energy = outputs['ra_energy'][:, :-12, 8:-8]
-            quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
+            # quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
             # occupancy_logits = outputs['occupancy_logits'][..., :-12, 8:-8]
             # quantile_preds = outputs['quantiles'][..., :-12, 8:-8]
             # radar_energy = outputs['ra_energy'][..., :-12, 8:-8]
             # 计算 Loss (严格按照我们设计的 API)
             loss_dict = criterion(
                 occupancy_logits=occupancy_logits, 
-                quantile_preds=quantile_preds,
+                # quantile_preds=quantile_preds,
                 occupancy_target=occupancy_target,
                 radar_energy=radar_energy
             )
@@ -184,7 +193,7 @@ def main():
             pbar.set_postfix({
                 'Tot': f"{loss.item():.3f}",
                 'Foc': f"{loss_dict['focal_loss'].item():.3f}",
-                'Qnt': f"{loss_dict['quantile_loss'].item():.3f}"
+                # 'Qnt': f"{loss_dict['quantile_loss'].item():.3f}"
             })
             
         avg_train_loss = total_train_loss / len(train_loader)
@@ -199,23 +208,32 @@ def main():
         count=0
         with torch.no_grad():
             for batch_data in val_loader:
-                radar_cube = batch_data['radar_cube'].to(args.device)
+                radar_cube = batch_data['radar_cube'].to(args.device) # (B, 512, 128, 256)
+                elevation_cube = batch_data['elevation_cube'].to(args.device) # (B, 512, 128, 256)
                 occupancy_target = batch_data['occupancy_target']
-                if len(occupancy_target.shape) == 4:
+                # if len(occupancy_target.shape) == 4:
                 # 沿第 1 维 (高度维度) 取最大值。
-                    occupancy_target, _ = torch.max(occupancy_target, dim=1)
-                occupancy_target=occupancy_target.to(args.device)
+                occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
+                occupancy_target_2d=occupancy_target_2d.to(args.device)
+                occupancy_target_3d=occupancy_target.to(args.device)
                 # occupancy_target = batch_data['occupancy_target'].to(args.device)
                 outputs = model(radar_cube)
                 
                 occupancy_logits = outputs['occupancy_logits'][:, :-12, 8:-8]
                 radar_energy = outputs['ra_energy'][:, :-12, 8:-8]
-                quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
-                qback_est=outputs['background_est'][:, :-12, 8:-8]
+                # quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
+                # qback_est=outputs['background_est'][:, :-12, 8:-8]
+
+                radar_cube_real = radar_cube[:, :-12, :, 8:-8]
+                elevation_cube_real = elevation_cube[:, :-12, :, 8:-8]
+                
+
+
+
 
                 loss_dict = criterion(
                 occupancy_logits=occupancy_logits, 
-                quantile_preds=quantile_preds,
+                # quantile_preds=quantile_preds,
                 occupancy_target=occupancy_target,
                 radar_energy=radar_energy
                 )
@@ -237,19 +255,36 @@ def main():
                 local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
                 alpha=1.0
                 final_pred_2d = radar_energy > (alpha * local_bg_noise_mean)
-                qpred=radar_energy > qback_est
+                # qpred=radar_energy > qback_est
 
-                qpred=qpred.cpu().detach().numpy()
-                gt_numpy=occupancy_target.cpu().detach().numpy()
-                final_pred_2d=final_pred_2d.cpu().detach().numpy()
-                pd, pfa = compute_pd_pfa(gt_numpy, final_pred_2d)
-                qpd ,qpfa= compute_pd_pfa(gt_numpy, qpred)
+
+                #revover
+                B, R, A = final_pred_2d.shape
+                max_doppler_idx = torch.argmax(radar_cube_real, dim=2)#(B, 500, 240)
+                elevation_val = torch.gather(elevation_cube_real, dim=2, index=max_doppler_idx.unsqueeze(2)).squeeze(2)#(B, 500, 240)
+                elevation_indices = torch.clamp((elevation_val * 34).long(), 0, 33)
+                final_pred_3d = torch.zeros_like(occupancy_target_3d_real)
+                final_pred_3d.scatter_(
+                    dim=1, 
+                    index=elevation_indices.unsqueeze(1), 
+                    src=final_pred_2d.unsqueeze(1).float() 
+                )
+
+                gt_3d_numpy = occupancy_target_3d_real.cpu().detach().numpy()
+                pred_3d_numpy = final_pred_3d.cpu().detach().numpy()
+
+                pd, pfa = compute_pd_pfa(gt_3d_numpy, pred_3d_numpy)
+                # qpred=qpred.cpu().detach().numpy()
+                # gt_numpy=occupancy_target.cpu().detach().numpy()
+                # final_pred_2d=final_pred_2d.cpu().detach().numpy()
+                # pd, pfa = compute_pd_pfa(gt_numpy, final_pred_2d)
+                # qpd ,qpfa= compute_pd_pfa(gt_numpy, qpred)
                 if count%10==0:
-                    print(f" Pd: {pd:.4f} |  Pfa: {pfa:.4f} /n Quantile Pd: {qpd:.4f} |  Pfa: {qpfa:.4f}")
+                    print(f" Pd: {pd:.4f} |  Pfa: {pfa:.4f} ")
                 pd_list.append(pd)
                 pfa_list.append(pfa)
-                qpd_list.append(qpd)
-                qpfa_list.append(qpfa)
+                # qpd_list.append(qpd)
+                # qpfa_list.append(qpfa)
                 count=count+1
 
 
@@ -264,22 +299,34 @@ def main():
         avg_val_loss = total_val_loss / len(val_loader)
         mean_pd = np.mean(pd_list)
         mean_pfa = np.mean(pfa_list)
-        mean_qpd = np.mean(qpd_list)
-        mean_qpfa = np.mean(qpfa_list)
-        print(f"\n[Validation Result] -> Average Pd: {mean_pd:.4f} | Average Pfa: {mean_pfa:.4f} Average QPd: {mean_qpd:.4f} | Average QPfa: {mean_qpfa:.4f}")
+        # mean_qpd = np.mean(qpd_list)
+        # mean_qpfa = np.mean(qpfa_list)
+        print(f"\n[Validation Result] -> Average Pd: {mean_pd:.4f} | Average Pfa: {mean_pfa:.4f}")
         print(f"👉 Epoch [{epoch+1}] Summary | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         
         # 保存最佳模型
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            save_path = os.path.join(args.save_dir, "best_fusion_model.pth")
-            torch.save(model.state_dict(), save_path)
+            file_name = f"best_epoch_{epoch+1}_loss_{avg_val_loss:.4f}.pth"
+            save_path = os.path.join(save_dir, file_name)
+            
+            # 保存完整的状态字典 (下面会讲为什么要存这么多东西)
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss
+            }
+            torch.save(checkpoint, save_path)
             print(f"🌟 新的最佳模型已保存 -> {save_path}")
+            # save_path = os.path.join(args.save_dir, "best_fusion_model.pth")
+            # torch.save(model.state_dict(), save_path)
+            # print(f"🌟 新的最佳模型已保存 -> {save_path}")
         scheduler.step(avg_val_loss)
         # 如果有外部 Evaluator，可以在每个 Epoch 末尾调用它算 AP / F1
-        if HAS_EXTERNAL_EVALUATOR and (epoch + 1) % 5 == 0:
-            evaluator = Evaluator()
-            evaluator.evaluate(model, val_loader, args.device)
+        # if HAS_EXTERNAL_EVALUATOR and (epoch + 1) % 5 == 0:
+        #     evaluator = Evaluator()
+        #     evaluator.evaluate(model, val_loader, args.device)
 
     print("\n🎉 训练圆满结束！")
 

@@ -55,8 +55,8 @@ class FastFusionModel(nn.Module):
         self.angle_bins = angle_bins
         
         # 分位数列表，用于估计背景噪声的分布
-        self.quantiles = [0.1, 0.5, 0.9] 
-        num_quantiles = len(self.quantiles)
+        # self.quantiles = [0.1, 0.5, 0.9] 
+        # num_quantiles = len(self.quantiles)
         
         # 1. doppler编码器qudiao
         
@@ -69,7 +69,7 @@ class FastFusionModel(nn.Module):
             encoder_weights="imagenet",         
             in_channels=doppler_channels, # 输入通道数等于doppler
             # 输出通道数 = 1个占据栅格预测(Occupancy) + 3个分位数预测(Quantiles)
-            classes=1 + num_quantiles     
+            classes=1   
         )
 
     def forward(self, radar_cube: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -82,32 +82,33 @@ class FastFusionModel(nn.Module):
         # 3. 把 U-Net 的输出一分为二
         # 第 0 个通道是 Occupancy（预测有没有障碍物）
         occupancy_logits = unet_out[:, 0, :, :]  # (B, R, A)
+        # occupancy_logits = unet_out # (B, R, A)
         # 经过 Sigmoid 变成 0~1 之间的概率
         occupancy = torch.sigmoid(occupancy_logits) 
         
         # 第 1 到 3 个通道是 Quantiles（预测背景噪声）
-        quantile_logits = unet_out[:, 1:, :, :]  # (B, 3, R, A)
+        # quantile_logits = unet_out[:, 1:, :, :]  # (B, 3, R, A)
         # 【核心优化】使用 softplus 激活函数！
         # 确保预测出来的噪声能量永远是正数，不然下面做除法会算出负的离谱分数
-        quantiles = F.softplus(quantile_logits)
-        quantiles = rearrange(quantiles, 'b q r a -> b r a q') # 把分位数放到最后一维方便取用
+        # quantiles = F.softplus(quantile_logits)
+        # quantiles = rearrange(quantiles, 'b q r a -> b r a q') # 把分位数放到最后一维方便取用
         
         # 4. 计算雷达原始能量图（对多普勒维度求平方平均）
         ra_energy = torch.mean(radar_cube ** 2, dim=1)
         
         # 5. 提取 (0.9) 对应的背景噪声估计
-        median_idx = self.quantiles.index(0.9)
-        background_est = quantiles[..., median_idx]
+        # median_idx = self.quantiles.index(0.9)
+        # background_est = quantiles[..., median_idx]
         
         # 6. 计算检测分数：信号能量 / (背景噪声 + 极小值防止除以0)
         # 也就是经典的 CFAR（恒虚警率）物理逻辑
-        detection_score = ra_energy / (background_est + 1e-8)
+        # detection_score = ra_energy / (background_est + 1e-8)
         
         return {
             'occupancy': occupancy,
-            'quantiles': quantiles,
-            'background_est': background_est,
-            'detection_score': detection_score,
+            # 'quantiles': quantiles,
+            # 'background_est': background_est,
+            # 'detection_score': detection_score,
             'occupancy_logits':occupancy_logits,
             'ra_energy': ra_energy
         }

@@ -92,18 +92,19 @@ class RadarFusionLoss(nn.Module):
     """
     def __init__(self, 
                  weight_focal: float = 1.0, 
-                 weight_quantile: float = 0.5, # 分位数回归通常数字较大，稍微降低点权重防止带偏主线
-                 quantiles: list = [0.1, 0.5, 0.9]):
+                #  weight_quantile: float = 0.5, # 分位数回归通常数字较大，稍微降低点权重防止带偏主线
+                #  quantiles: list = [0.1, 0.5, 0.9]
+                ):
         super().__init__()
         self.weight_focal = weight_focal
-        self.weight_quantile = weight_quantile
+        # self.weight_quantile = weight_quantile
         
         self.focal_loss = StableFocalLoss()
-        self.quantile_loss = MaskedQuantileLoss(quantiles=quantiles)
+        # self.quantile_loss = MaskedQuantileLoss(quantiles=quantiles)
 
     def forward(self, 
                 occupancy_logits: torch.Tensor,   #  U-Net 没过 sigmoid 的原始输出
-                quantile_preds: torch.Tensor,     # U-Net 预测的分位数
+                # quantile_preds: torch.Tensor,     # U-Net 预测的分位数
                 occupancy_target: torch.Tensor,   # LiDAR gt
                 radar_energy: torch.Tensor        # radar original
                 ) -> dict:
@@ -112,14 +113,14 @@ class RadarFusionLoss(nn.Module):
         loss_focal = self.focal_loss(occupancy_logits, occupancy_target)
         
         # 2. 算底噪 Loss（学背景）
-        loss_quantile = self.quantile_loss(quantile_preds, radar_energy, occupancy_target)
+        # loss_quantile = self.quantile_loss(quantile_preds, radar_energy, occupancy_target)
         
         # 3. 按权重相加
-        total_loss = self.weight_focal * loss_focal + self.weight_quantile * loss_quantile
+        total_loss = self.weight_focal * loss_focal #+ self.weight_quantile * loss_quantile
         
         # 返回一个字典，方便你在训练循环里打印和监控每个 Loss 的下降情况
         return {
             'total_loss': total_loss,
             'focal_loss': loss_focal,
-            'quantile_loss': loss_quantile
+            # 'quantile_loss': loss_quantile
         }
