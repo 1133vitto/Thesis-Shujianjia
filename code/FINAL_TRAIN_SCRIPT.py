@@ -221,6 +221,7 @@ def main():
                 
                 occupancy_logits = outputs['occupancy_logits'][:, :-12, 8:-8]
                 radar_energy = outputs['ra_energy'][:, :-12, 8:-8]
+                occupancy=outputs['occupancy'][:, :-12, 8:-8]
                 # quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
                 # qback_est=outputs['background_est'][:, :-12, 8:-8]
 
@@ -234,7 +235,7 @@ def main():
                 loss_dict = criterion(
                 occupancy_logits=occupancy_logits, 
                 # quantile_preds=quantile_preds,
-                occupancy_target=occupancy_target,
+                occupancy_target=occupancy_target_2d,
                 radar_energy=radar_energy
                 )
                 total_val_loss += loss_dict['total_loss'].item()
@@ -242,7 +243,7 @@ def main():
                 # gtcube=occupancy_target.cpu().detach().numpy()
                 # occupancy_logits=occupancy_logits.cpu().detach().numpy()
                 # radar_energy=radar_energy.cpu().detach().numpy()
-                pred=1.0-occupancy_logits
+                pred=1.0-occupancy
                 bgenergy=pred*radar_energy
 
                 kernel_size = 5
@@ -250,11 +251,11 @@ def main():
             
                 # 使用平均池化计算局部背景均值
                 local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
-                local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
+                # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
 
-                local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
+                # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
                 alpha=1.0
-                final_pred_2d = radar_energy > (alpha * local_bg_noise_mean)
+                final_pred_2d = radar_energy > (alpha * local_bg_noise_sum)
                 # qpred=radar_energy > qback_est
 
 
@@ -263,14 +264,14 @@ def main():
                 max_doppler_idx = torch.argmax(radar_cube_real, dim=2)#(B, 500, 240)
                 elevation_val = torch.gather(elevation_cube_real, dim=2, index=max_doppler_idx.unsqueeze(2)).squeeze(2)#(B, 500, 240)
                 elevation_indices = torch.clamp((elevation_val * 34).long(), 0, 33)
-                final_pred_3d = torch.zeros_like(occupancy_target_3d_real)
+                final_pred_3d = torch.zeros_like(occupancy_target_3d)
                 final_pred_3d.scatter_(
                     dim=1, 
                     index=elevation_indices.unsqueeze(1), 
                     src=final_pred_2d.unsqueeze(1).float() 
                 )
 
-                gt_3d_numpy = occupancy_target_3d_real.cpu().detach().numpy()
+                gt_3d_numpy = occupancy_target_3d.cpu().detach().numpy()
                 pred_3d_numpy = final_pred_3d.cpu().detach().numpy()
 
                 pd, pfa = compute_pd_pfa(gt_3d_numpy, pred_3d_numpy)

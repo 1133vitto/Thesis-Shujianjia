@@ -12,7 +12,7 @@ class StableFocalLoss(nn.Module):
     数值稳定的 Focal Loss
     专门用于处理“大片空地（背景），极少障碍物（目标）”的极度不平衡问题。
     """
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+    def __init__(self, alpha: float = 0.95, gamma: float = 2.0):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
