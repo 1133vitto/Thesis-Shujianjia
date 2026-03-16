@@ -9,7 +9,7 @@ from pathlib import Path
 import torch.nn.functional as F
 current_dir = Path(__file__).resolve().parent
 radelft_dir = current_dir / "radelft"
-sys.path.insert(0, str(radelft_dir)) # 插到最前面，拥有最高优先级
+sys.path.insert(0, str(radelft_dir)) 
 sys.path.insert(0, str(current_dir))
 import torch
 import torch.optim as optim
@@ -17,15 +17,15 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import os
 import argparse
-from tqdm import tqdm  # 进度条神器
+from tqdm import tqdm  
 from radelft.utils.compute_metrics import compute_metrics_time, compute_pd_pfa
 
 
-# 导入我们刚刚重构的核心利器
-from model import FastFusionModel
+
+from model import FastFusionModel, MaxPower2DModel
 from losses import RadarFusionLoss
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
-# 如果你有自己写的 evaluator，可以在这里 try-except 导入
+
 try:
     from evaluation import Evaluator
     HAS_EXTERNAL_EVALUATOR = True
@@ -37,42 +37,40 @@ torch.set_float32_matmul_precision('medium')
 
 class RaDelftWrapper(Dataset):
     """
-    数据集适配器：
-    1. 负责把 RADCUBE_DATASET 吐出的元组，转换成我们训练循环需要的字典格式。
-    2. 负责剔除 Elevation，只保留 Power。
-    3. 负责修复维度的顺序，对齐模型输入。
+    need to be modify later
     """
     def __init__(self, mode='train', params=None):
-        # 内部实例化你真实的 Dataset
+        # the same Dataset used in radelft
         self.real_dataset = RADCUBE_DATASET(mode=mode, params=params)
 
     def __len__(self):
         return len(self.real_dataset)
 
     def __getitem__(self, idx):
-        # 从真实 dataset 中拿到数据
+        
         input_cube, gt_cube, item_params = self.real_dataset[idx]
         
-        # 1. 剥离 Elevation，提取 Power
-        # 此时 input_cube 形状是 (2, 128, 512, 256) -> (Channel, Doppler, Range, Azimuth)
-        # 索引 0 就是 Power
-        power_cube = input_cube[0] # 形状变成 (128, 512, 256)
+        # 1. seperate Elevation /Power
+        #  input_cube  (2, 128, 512, 256) -> (Channel, Doppler, Range, Azimuth)
+        # index 0 refers to Power
+        power_cube = input_cube[0] #  (128, 512, 256)
         elevation_cube = input_cube[1] # (128, 512, 256) 
         
-        # 2. 修复维度顺序
-        # 我们的模型需要 (Range, Doppler, Azimuth)，所以把第0维和第1维换一下
-        power_cube = np.transpose(power_cube, (1, 0, 2)) # 形状完美变成 (512, 128, 256)
+        # 2. adjust the order
+        # 
+        power_cube = np.transpose(power_cube, (1, 0, 2)) #  (512, 128, 256)
         elevation_cube = np.transpose(elevation_cube, (1, 0, 2))
         
-        # 3. 处理真值 (确保是 2D 的 Range x Azimuth)
-        # 有时候 gt_cube 可能会带一个通道维度，比如 (1, 512, 256)，我们用 squeeze 把多余的 1 挤掉
+        # 3. GT
+        # 
         occupancy_target = np.squeeze(gt_cube) 
 
-        # 4. 组装成我们 Loss 和 Model 需要的字典格式
+        
         return {
             'radar_cube': torch.from_numpy(power_cube).float(),
             'elevation_cube': torch.from_numpy(elevation_cube).float(),
-            'occupancy_target': torch.from_numpy(occupancy_target).float()
+            'occupancy_target': torch.from_numpy(occupancy_target).float(),
+            'metadata': item_params  
         }
 
 
@@ -86,7 +84,6 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
-    # 网络维度参数 (需要跟你的真实数据对齐)
     parser.add_argument('--range_bins', type=int, default=512)
     parser.add_argument('--doppler_bins', type=int, default=128)
     parser.add_argument('--angle_bins', type=int, default=256)
@@ -97,22 +94,21 @@ def main():
     args = parser.parse_args()
     
     print("="*70)
-    print("🚀 启动训练：雷达-LiDAR 融合感知网络 🚀")
-    print(f"🖥️  运算设备: {args.device}")
-    print(f"📂 数据模式: {'RaDelft 真实数据' if args.use_radelft else '本地安全模拟数据'}")
+    print("启动训练")
+    print(f" 运算设备: {args.device}")
+    print(f" 数据模式: {'RaDelft 真实数据' if args.use_radelft else '模拟数据'}")
     print("="*70)
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"run_{current_time}"
-    # 例如：./checkpoints/run_20240516_143000
+    
     save_dir = os.path.join(args.save_dir, run_name) 
     os.makedirs(save_dir, exist_ok=True)
-    print(f"📁 本次训练的所有权重将保存在: {save_dir}")
+    print(f"本次训练的所有权重将保存在: {save_dir}")
     # os.makedirs(args.save_dir, exist_ok=True)
     
-    # 1. 准备数据
+    #load the data
     if args.use_radelft:
         # RaDelft
-        # 请确保 RaDelft dataset 返回的字典里有 'radar_cube' 和 'occupancy_target' 这两个 key
         from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
         from radelft.data_preparation import data_preparation
         params = data_preparation.get_default_params()
@@ -125,45 +121,48 @@ def main():
     #     train_dataset = SafeMockDataset(num_samples=200, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
     #     val_dataset = SafeMockDataset(num_samples=40, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=32 if args.device=='cuda' else 0)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16 if args.device=='cuda' else 0)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # 2. 初始化极简融合模型
-    model = FastFusionModel(
-        angle_bins=args.angle_bins,
-        doppler_channels=128
+    # 2. model
+    # model = FastFusionModel(
+    #     angle_bins=args.angle_bins,
+    #     doppler_channels=128
+    # ).to(args.device)
+
+    model = MaxPower2DModel(
+        in_channels=2
     ).to(args.device)
     
-    # 3. 初始化物理严谨的融合 Loss
+    # 3.  Loss
     criterion = RadarFusionLoss(weight_focal=1.0)
     
-    # 4. 优化器
+    # 4. optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4) # AdamW 比 Adam 更利于泛化
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
 
-# 然后在每个 epoch 结束，算完 avg_val_loss 后，告诉 scheduler 现在的状态：
+
     
     best_val_loss = float('inf')
     
-    # 5. 核心训练循环
+    # 5. training loop
     for epoch in range(args.num_epochs):
         model.train()
         total_train_loss = 0.0
         
-        # 使用 tqdm 包装 train_loader 形成进度条
         pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{args.num_epochs}] Train")
         
         for batch_data in pbar:
             radar_cube = batch_data['radar_cube'].to(args.device)
             occupancy_target = batch_data['occupancy_target']
             if len(occupancy_target.shape) == 4:
-                # 沿第 1 维 (高度维度) 取最大值。
-                # 物理意义：只要这 34 层里有 1，投影下来的 2D 结果就是 1。
+                # height find max, 34 layers -> 1 layer
+                # collapse the height dimension by taking the maximum value across it, resulting in a 2D occupancy map
                 occupancy_target, _ = torch.max(occupancy_target, dim=1)
             occupancy_target=occupancy_target.to(args.device)
             optimizer.zero_grad()
             
-            # 前向传播 (输出包含了 logits, 概率, 分位数估计, 以及雷达原始能量)
+            # forward
             outputs = model(radar_cube)
             occupancy_logits = outputs['occupancy_logits'][:, :-12, 8:-8]
             radar_energy = outputs['ra_energy'][:, :-12, 8:-8]
@@ -171,7 +170,6 @@ def main():
             # occupancy_logits = outputs['occupancy_logits'][..., :-12, 8:-8]
             # quantile_preds = outputs['quantiles'][..., :-12, 8:-8]
             # radar_energy = outputs['ra_energy'][..., :-12, 8:-8]
-            # 计算 Loss (严格按照我们设计的 API)
             loss_dict = criterion(
                 occupancy_logits=occupancy_logits, 
                 # quantile_preds=quantile_preds,
@@ -182,14 +180,13 @@ def main():
             loss = loss_dict['total_loss']
             loss.backward()
             
-            # 梯度裁剪：防止训练初期极端噪声导致梯度爆炸
+            # gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             
             optimizer.step()
             
             total_train_loss += loss.item()
             
-            # 在进度条上实时显示各项 Loss
             pbar.set_postfix({
                 'Tot': f"{loss.item():.3f}",
                 'Foc': f"{loss_dict['focal_loss'].item():.3f}",
@@ -198,7 +195,7 @@ def main():
             
         avg_train_loss = total_train_loss / len(train_loader)
         
-        # 6. 验证循环
+        # 6. validation loop
         model.eval()
         total_val_loss = 0.0
         pd_list = []
@@ -211,8 +208,6 @@ def main():
                 radar_cube = batch_data['radar_cube'].to(args.device) # (B, 512, 128, 256)
                 elevation_cube = batch_data['elevation_cube'].to(args.device) # (B, 512, 128, 256)
                 occupancy_target = batch_data['occupancy_target']
-                # if len(occupancy_target.shape) == 4:
-                # 沿第 1 维 (高度维度) 取最大值。
                 occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
                 occupancy_target_2d=occupancy_target_2d.to(args.device)
                 occupancy_target_3d=occupancy_target.to(args.device)
@@ -240,16 +235,13 @@ def main():
                 )
                 total_val_loss += loss_dict['total_loss'].item()
 
-                # gtcube=occupancy_target.cpu().detach().numpy()
-                # occupancy_logits=occupancy_logits.cpu().detach().numpy()
-                # radar_energy=radar_energy.cpu().detach().numpy()
                 pred=1.0-occupancy
                 bgenergy=pred*radar_energy
 
                 kernel_size = 5
                 pad = kernel_size // 2
             
-                # 使用平均池化计算局部背景均值
+                # avg pooling to get local background noise sum
                 local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
                 # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
 
@@ -259,9 +251,10 @@ def main():
                 # qpred=radar_energy > qback_est
 
 
-                #revover
+                #recover 3d
                 B, R, A = final_pred_2d.shape
-                max_doppler_idx = torch.argmax(radar_cube_real, dim=2)#(B, 500, 240)
+                max_doppler_idx=outputs['max_doppler_idx'][:, :-12, 8:-8] #(B, 500, 240)
+                # max_doppler_idx = torch.argmax(radar_cube_real, dim=2)#(B, 500, 240)
                 elevation_val = torch.gather(elevation_cube_real, dim=2, index=max_doppler_idx.unsqueeze(2)).squeeze(2)#(B, 500, 240)
                 elevation_indices = torch.clamp((elevation_val * 34).long(), 0, 33)
                 final_pred_3d = torch.zeros_like(occupancy_target_3d)
@@ -303,15 +296,15 @@ def main():
         # mean_qpd = np.mean(qpd_list)
         # mean_qpfa = np.mean(qpfa_list)
         print(f"\n[Validation Result] -> Average Pd: {mean_pd:.4f} | Average Pfa: {mean_pfa:.4f}")
-        print(f"👉 Epoch [{epoch+1}] Summary | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        print(f" Epoch [{epoch+1}] Summary | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         
-        # 保存最佳模型
+        # save the parameters of the best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             file_name = f"best_epoch_{epoch+1}_loss_{avg_val_loss:.4f}.pth"
             save_path = os.path.join(save_dir, file_name)
             
-            # 保存完整的状态字典 (下面会讲为什么要存这么多东西)
+            # Save the complete state dictionary, including model weights and optimizer state
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -319,17 +312,17 @@ def main():
                 'best_val_loss': best_val_loss
             }
             torch.save(checkpoint, save_path)
-            print(f"🌟 新的最佳模型已保存 -> {save_path}")
+            print(f" 新的最佳模型已保存 -> {save_path}")
             # save_path = os.path.join(args.save_dir, "best_fusion_model.pth")
             # torch.save(model.state_dict(), save_path)
-            # print(f"🌟 新的最佳模型已保存 -> {save_path}")
+            # print(f" 新的最佳模型已保存 -> {save_path}")
         scheduler.step(avg_val_loss)
         # 如果有外部 Evaluator，可以在每个 Epoch 末尾调用它算 AP / F1
         # if HAS_EXTERNAL_EVALUATOR and (epoch + 1) % 5 == 0:
         #     evaluator = Evaluator()
         #     evaluator.evaluate(model, val_loader, args.device)
 
-    print("\n🎉 训练圆满结束！")
+    print("\n 训练圆满结束！")
 
 if __name__ == "__main__":
     main()
