@@ -19,7 +19,7 @@ import os
 import argparse
 from tqdm import tqdm  
 from radelft.utils.compute_metrics import compute_metrics_time, compute_pd_pfa
-
+import torchvision.transforms.functional as TF
 
 
 from model import FastFusionModel, MaxPower2DModel
@@ -173,10 +173,21 @@ def main():
             # occupancy_logits = outputs['occupancy_logits'][..., :-12, 8:-8]
             # quantile_preds = outputs['quantiles'][..., :-12, 8:-8]
             # radar_energy = outputs['ra_energy'][..., :-12, 8:-8]
+            occupancy_target = occupancy_target.unsqueeze(1) #(B, 1, R, A)
+            soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
+            batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
+            batch_max = batch_max.view(-1, 1, 1, 1)
+            soft_targets_norm = soft_targets / (batch_max + 1e-8)
+            soft_targets = soft_targets_norm.squeeze(1) #(B, R, A)
+
+
+
+
+
             loss_dict = criterion(
                 occupancy_logits=occupancy_logits, 
                 # quantile_preds=quantile_preds,
-                occupancy_target=occupancy_target,
+                occupancy_target=soft_targets,
                 radar_energy=radar_energy
             )
             

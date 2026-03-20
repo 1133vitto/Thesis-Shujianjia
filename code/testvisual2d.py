@@ -195,7 +195,8 @@ def main():
             
             # 1. Radar Energy
             radar_energy_db = 10 * np.log10(radar_energy_np + 1e-9)+39.54
-            im0 = axes[0].imshow(radar_energy_db, cmap='viridis', aspect='auto',vmin=-10, vmax=40)
+            bg_noise_db = 10 * np.log10(bg_noise_np + 1e-9)+39.54
+            im0 = axes[0].imshow(radar_energy_db, cmap='viridis', aspect='auto')
             axes[0].set_title("Radar Energy")
             plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
@@ -205,7 +206,7 @@ def main():
             plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
 
             # 3. Local BG Noise Sum
-            im2 = axes[2].imshow(bg_noise_np, cmap='viridis', aspect='auto')
+            im2 = axes[2].imshow(bg_noise_db, cmap='viridis', aspect='auto')
             axes[2].set_title("Local BG Noise Sum")
             plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
 
