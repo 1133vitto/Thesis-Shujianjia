@@ -54,12 +54,12 @@ class RaDelftWrapper(Dataset):
         #  input_cube  (2, 128, 512, 256) -> (Channel, Doppler, Range, Azimuth)
         # index 0 refers to Power
         power_cube = input_cube[0] #  (128, 512, 256)
-        elevation_cube = input_cube[1] # (128, 512, 256) 
+        # elevation_cube = input_cube[1] # (128, 512, 256) 
         
         # 2. adjust the order
         # 
         power_cube = np.transpose(power_cube, (1, 0, 2)) #  (512, 128, 256)
-        elevation_cube = np.transpose(elevation_cube, (1, 0, 2))
+        # elevation_cube = np.transpose(elevation_cube, (1, 0, 2))
         
         # 3. GT
         # 
@@ -68,7 +68,7 @@ class RaDelftWrapper(Dataset):
         
         return {
             'radar_cube': torch.from_numpy(power_cube).float(),
-            'elevation_cube': torch.from_numpy(elevation_cube).float(),
+            # 'elevation_cube': torch.from_numpy(elevation_cube).float(),
             'occupancy_target': torch.from_numpy(occupancy_target).float(),
             'metadata': item_params  
         }
@@ -94,7 +94,7 @@ def main():
     args = parser.parse_args()
     
     print("="*70)
-    print("启动训练")
+    print("启动2d训练")
     print(f" 运算设备: {args.device}")
     print(f" 数据模式: {'RaDelft 真实数据' if args.use_radelft else '模拟数据'}")
     print("="*70)
@@ -197,7 +197,7 @@ def main():
             })
             # step+=1
             # if step>3:
-            #     break  # Only run a few batches to test the validation loop. delete this line during formal training.
+                # break  # Only run a few batches to test the validation loop. delete this line during formal training.
         avg_train_loss = total_train_loss / len(train_loader)
         
         # 6. validation loop
@@ -211,7 +211,6 @@ def main():
         with torch.no_grad():
             for batch_data in val_loader:
                 radar_cube = batch_data['radar_cube'].to(args.device) # (B, 512, 128, 256)
-                elevation_cube = batch_data['elevation_cube'].to(args.device) # (B, 512, 128, 256)
                 occupancy_target = batch_data['occupancy_target']
                 occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
                 occupancy_target_2d=occupancy_target_2d.to(args.device)
@@ -226,7 +225,7 @@ def main():
                 # qback_est=outputs['background_est'][:, :-12, 8:-8]
 
                 radar_cube_real = radar_cube[:, :-12, :, 8:-8]
-                elevation_cube_real = elevation_cube[:, :-12, :, 8:-8]
+                
                 
 
 
@@ -243,7 +242,7 @@ def main():
                 occupancy_logits=occupancy_logits.unsqueeze(1) #(B, 1, R, A)
                 pred=1.0-occupancy_logits
                 bgenergy=pred*radar_energy
-                # print(f"radar_energy.shape: {radar_energy.shape} | bgenergy.shape: {bgenergy.shape}, occupancy_logits.shape: {occupancy_logits.shape}")
+                print(f"radar_energy.shape: {radar_energy.shape} | bgenergy.shape: {bgenergy.shape}, occupancy_logits.shape: {occupancy_logits.shape}")
                 kernel_size = 5
                 pad = kernel_size // 2
             
@@ -257,25 +256,18 @@ def main():
                 # qpred=radar_energy > qback_est
 
 
-                #recover 3d
+                
                 final_pred_2d = final_pred_2d.squeeze()
-                # print(f"final_pred_2d.shape: {final_pred_2d.shape}")
+                print(f"final_pred_2d.shape: {final_pred_2d.shape}")
                 # B, R, A = final_pred_2d.shape
                 max_doppler_idx=outputs['max_indices'][:, :-12, 8:-8] #(B, 500, 240)
                 # max_doppler_idx = torch.argmax(radar_cube_real, dim=2)#(B, 500, 240)
-                elevation_val = torch.gather(elevation_cube_real, dim=2, index=max_doppler_idx.unsqueeze(2)).squeeze(2)#(B, 500, 240)
-                elevation_indices = torch.clamp((elevation_val * 34).long(), 0, 33)
-                final_pred_3d = torch.zeros_like(occupancy_target_3d)
-                final_pred_3d.scatter_(
-                    dim=1, 
-                    index=elevation_indices.unsqueeze(1), 
-                    src=final_pred_2d.unsqueeze(1).float() 
-                )
+                
 
-                gt_3d_numpy = occupancy_target_3d.cpu().detach().numpy()
-                pred_3d_numpy = final_pred_3d.cpu().detach().numpy()
+                gt_2d_numpy = occupancy_target_2d.cpu().detach().numpy()
+                pred_2d_numpy = final_pred_2d.cpu().detach().numpy()
 
-                pd, pfa = compute_pd_pfa(gt_3d_numpy, pred_3d_numpy)
+                pd, pfa = compute_pd_pfa(gt_2d_numpy, pred_2d_numpy)
                 # qpred=qpred.cpu().detach().numpy()
                 # gt_numpy=occupancy_target.cpu().detach().numpy()
                 # final_pred_2d=final_pred_2d.cpu().detach().numpy()

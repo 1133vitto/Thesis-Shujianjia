@@ -27,11 +27,11 @@ env/
 ENV/
 
 # Checkpoints and results
-checkpoints/*.pth
-results/*.npy
-results/*.ply
-results/*.png
-results/*.txt
+/code/checkpoints/*.pth
+/code/results/*.npy
+/code/results/*.ply
+/code/results/*.png
+/code/results/*.txt
 
 # IDE
 .vscode/
@@ -44,3 +44,7 @@ results/*.txt
 .DS_Store
 Thumbs.db
 
+#visual
+
+/code/results/
+/code/checkpoints/

@@ -101,6 +101,6 @@ class MaxPower2DModel(nn.Module):
         
         return {
             'occupancy_logits': logits.squeeze(), # (B, R, A)
-            'ra_energy': max_power,                # (B, R, A)
-            'max_indices': max_indices             # (B, R, A)
+            'ra_energy': max_power,                # (B, 1,R, A)
+            'max_indices': max_indices             # (B,1, R, A)
         }
