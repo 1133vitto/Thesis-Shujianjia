@@ -83,8 +83,7 @@ def main():
     args = parser.parse_args()
     
     # 1. 创建输出目录
-    run_name = f"run_{current_time}"
-    vis_dir = os.path.join(args.output_dir, 'visualizations')
+    vis_dir = os.path.join(args.output_dir, 'visualizationsnew3')
     os.makedirs(vis_dir, exist_ok=True)
     
     print("="*70)
@@ -116,7 +115,7 @@ def main():
 
     # 4. 指标统计列表
     metrics_records = []
-    
+    step=0
     # 5. 推理循环
     with torch.no_grad():
         for batch_idx, batch_data in enumerate(tqdm(test_loader, desc="Testing & Plotting")):
@@ -148,7 +147,7 @@ def main():
             local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
             
             # 最终的二值化预测
-            alpha = 1.0
+            alpha = 2.0
             final_pred_2d = radar_energy_4d > (alpha * local_bg_noise_sum)
             
             # ==============================
@@ -195,7 +194,8 @@ def main():
             # radar_energy 和 bg_noise 可能会超出 1，如果超出的话，你可以去掉 vmax=1 或者做归一化
             
             # 1. Radar Energy
-            im0 = axes[0].imshow(radar_energy_np, cmap='viridis', aspect='auto')
+            radar_energy_db = 10 * np.log10(radar_energy_np + 1e-9)+39.54
+            im0 = axes[0].imshow(radar_energy_db, cmap='viridis', aspect='auto',vmin=-10, vmax=40)
             axes[0].set_title("Radar Energy")
             plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
@@ -223,38 +223,41 @@ def main():
             save_path = os.path.join(vis_dir, f"scene_{scene_id}_frame_{frame_id}.png")
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             plt.close(fig) # 防止内存泄漏
+            step+=1
+            if step>10:
+                break# 先测试前10帧的可视化，节省时间:
 
     # ==============================
     # 汇总并保存所有指标
     # ==============================
-    df_metrics = pd.DataFrame(metrics_records)
+    # df_metrics = pd.DataFrame(metrics_records)
     
-    # 过滤掉 Chamfer Distance 计算中的 NaN (比如 GT 或 Pred 全黑的情况)
-    valid_cd = df_metrics['Chamfer_Dist'].dropna()
-    avg_cd = valid_cd.mean() if not valid_cd.empty else float('nan')
+    # # 过滤掉 Chamfer Distance 计算中的 NaN (比如 GT 或 Pred 全黑的情况)
+    # valid_cd = df_metrics['Chamfer_Dist'].dropna()
+    # avg_cd = valid_cd.mean() if not valid_cd.empty else float('nan')
     
-    avg_pd = df_metrics['Pd'].mean()
-    avg_pfa = df_metrics['Pfa'].mean()
+    # avg_pd = df_metrics['Pd'].mean()
+    # avg_pfa = df_metrics['Pfa'].mean()
     
     # 保存 CSV
-    csv_path = os.path.join(args.output_dir, "metrics_report_1.csv")
-    df_metrics.to_csv(csv_path, index=False)
+    # csv_path = os.path.join(args.output_dir, "metrics_report_1.csv")
+    # df_metrics.to_csv(csv_path, index=False)
     
     # 保存 TXT Summary
-    txt_path = os.path.join(args.output_dir, "summary.txt")
-    with open(txt_path, "w") as f:
-        f.write("=== 2D Radar Fusion Model Test Summary ===\n")
-        f.write(f"Model: {args.checkpoint_path}\n")
-        f.write(f"Total Frames Tested: {len(df_metrics)}\n\n")
-        f.write(f"Average Pd: {avg_pd:.4f}\n")
-        f.write(f"Average Pfa: {avg_pfa:.6f}\n")
-        f.write(f"Average Chamfer Distance: {avg_cd:.4f}\n")
+    # txt_path = os.path.join(args.output_dir, "summary.txt")
+    # with open(txt_path, "w") as f:
+    #     f.write("=== 2D Radar Fusion Model Test Summary ===\n")
+    #     f.write(f"Model: {args.checkpoint_path}\n")
+    #     f.write(f"Total Frames Tested: {len(df_metrics)}\n\n")
+    #     f.write(f"Average Pd: {avg_pd:.4f}\n")
+    #     f.write(f"Average Pfa: {avg_pfa:.6f}\n")
+    #     f.write(f"Average Chamfer Distance: {avg_cd:.4f}\n")
         
     print("\n✅ 推理和可视化全部完成！")
-    print(f"👉 可视化图片文件夹: {vis_dir}")
-    print(f"👉 详细指标数据: {csv_path}")
-    print(f"👉 平均性能总结: {txt_path}")
-    print(f"   平均 Pd: {avg_pd:.4f} | 平均 Pfa: {avg_pfa:.6f} | 平均倒角距离: {avg_cd:.4f}")
+    # print(f"👉 可视化图片文件夹: {vis_dir}")
+    # print(f"👉 详细指标数据: {csv_path}")
+    # print(f"👉 平均性能总结: {txt_path}")
+    # print(f"   平均 Pd: {avg_pd:.4f} | 平均 Pfa: {avg_pfa:.6f} | 平均倒角距离: {avg_cd:.4f}")
 
 if __name__ == "__main__":
     main()
