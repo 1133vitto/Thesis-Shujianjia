@@ -20,6 +20,7 @@ import argparse
 from tqdm import tqdm  
 from radelft.utils.compute_metrics import compute_metrics_time, compute_pd_pfa
 import torchvision.transforms.functional as TF
+import wandb
 
 
 from model import FastFusionModel, MaxPower2DModel
@@ -81,7 +82,7 @@ class RaDelftWrapper(Dataset):
 def main():
     parser = argparse.ArgumentParser(description='训练脚本')
     parser.add_argument('--use_radelft', default=True ,action='store_true', help='使用真实的 RaDelft 数据集')
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--range_bins', type=int, default=512)
@@ -93,6 +94,8 @@ def main():
     
     args = parser.parse_args()
     
+    wandb.init(project="hpc-network-test", name="first-try")
+
     print("="*70)
     print("启动2d训练")
     print(f" 运算设备: {args.device}")
@@ -121,7 +124,7 @@ def main():
     #     train_dataset = SafeMockDataset(num_samples=200, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
     #     val_dataset = SafeMockDataset(num_samples=40, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8 if args.device=='cuda' else 0)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16 if args.device=='cuda' else 0)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
     # 2. model
@@ -206,9 +209,10 @@ def main():
                 'Foc': f"{loss_dict['focal_loss'].item():.3f}",
                 # 'Qnt': f"{loss_dict['quantile_loss'].item():.3f}"
             })
+            wandb.log({"epoch": epoch, "loss": loss})
             # step+=1
             # if step>3:
-                # break  # Only run a few batches to test the validation loop. delete this line during formal training.
+            #     break  # Only run a few batches to test the validation loop. delete this line during formal training.
         avg_train_loss = total_train_loss / len(train_loader)
         
         # 6. validation loop
@@ -236,6 +240,13 @@ def main():
                 # qback_est=outputs['background_est'][:, :-12, 8:-8]
 
                 radar_cube_real = radar_cube[:, :-12, :, 8:-8]
+
+                occupancy_target = occupancy_target_2d.unsqueeze(1) #(B, 1, R, A)
+                soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
+                batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
+                batch_max = batch_max.view(-1, 1, 1, 1)
+                soft_targets_norm = soft_targets / (batch_max + 1e-8)
+                soft_targets = soft_targets_norm.squeeze(1) #(B, R, A)
                 
                 
 
@@ -245,7 +256,7 @@ def main():
                 loss_dict = criterion(
                 occupancy_logits=occupancy_logits, 
                 # quantile_preds=quantile_preds,
-                occupancy_target=occupancy_target_2d,
+                occupancy_target=soft_targets,
                 radar_energy=radar_energy
                 )
                 total_val_loss += loss_dict['total_loss'].item()
@@ -262,7 +273,7 @@ def main():
                 # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
 
                 # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
-                alpha=1.0
+                alpha=2.0
                 final_pred_2d = radar_energy > (alpha * local_bg_noise_sum)
                 # qpred=radar_energy > qback_est
 
