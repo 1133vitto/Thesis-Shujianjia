@@ -83,7 +83,7 @@ def main():
     args = parser.parse_args()
     
     # 1. 创建输出目录
-    vis_dir = os.path.join(args.output_dir, 'visualizationsnew3')
+    vis_dir = os.path.join(args.output_dir, 'visualizations323')
     os.makedirs(vis_dir, exist_ok=True)
     
     print("="*70)
@@ -147,7 +147,7 @@ def main():
             local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
             
             # 最终的二值化预测
-            alpha = 2.0
+            alpha = 1.0
             final_pred_2d = radar_energy_4d > (alpha * local_bg_noise_sum)
             
             # ==============================
@@ -177,7 +177,7 @@ def main():
             cd_val = compute_chamfer_distance_2d(gt_np, final_pred_np)
             print(f"{title_info} -> Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}")
             metrics_records.append({
-                'Scene': scene_id,
+                'Alpha': alpha,
                 'Frame': frame_id,
                 'Pd': pd_val,
                 'Pfa': pfa_val,
@@ -221,7 +221,7 @@ def main():
             plt.tight_layout()
             
             # 保存图片
-            save_path = os.path.join(vis_dir, f"scene_{scene_id}_frame_{frame_id}.png")
+            save_path = os.path.join(vis_dir, f"alpha_{alpha}_frame_{frame_id}.png")
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             plt.close(fig) # 防止内存泄漏
             step+=1

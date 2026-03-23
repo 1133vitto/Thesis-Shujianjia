@@ -132,7 +132,7 @@ def main():
 
     # 4. 指标统计列表
     metrics_records = []
-    test_alphas = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    test_alphas = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
     # 5. 推理循环
     with torch.no_grad():
         for batch_idx, batch_data in enumerate(tqdm(test_loader, desc="Testing & Plotting")):
@@ -220,24 +220,24 @@ def main():
     avg_pfa = df_metrics['Pfa'].mean()
     
     # 保存 CSV
-    csv_path = os.path.join(args.output_dir, "metrics_report.csv")
+    csv_path = os.path.join(args.output_dir, "metrics_report323.csv")
     df_metrics.to_csv(csv_path, index=False)
     
     # 保存 TXT Summary
-    txt_path = os.path.join(args.output_dir, "summary.txt")
-    with open(txt_path, "w") as f:
-        f.write("=== 2D Radar Fusion Model Test Summary ===\n")
-        f.write(f"Model: {args.checkpoint_path}\n")
-        f.write(f"Total Frames Tested: {len(df_metrics)}\n\n")
-        f.write(f"Average Pd: {avg_pd:.4f}\n")
-        f.write(f"Average Pfa: {avg_pfa:.6f}\n")
-        f.write(f"Average Chamfer Distance: {avg_cd:.4f}\n")
+    # txt_path = os.path.join(args.output_dir, "summary323.txt")
+    # with open(txt_path, "w") as f:
+    #     f.write("=== 2D Radar Fusion Model Test Summary ===\n")
+    #     f.write(f"Model: {args.checkpoint_path}\n")
+    #     f.write(f"Total Frames Tested: {len(df_metrics)}\n\n")
+    #     f.write(f"Average Pd: {avg_pd:.4f}\n")
+    #     f.write(f"Average Pfa: {avg_pfa:.6f}\n")
+    #     f.write(f"Average Chamfer Distance: {avg_cd:.4f}\n")
         
     print("\n✅ 推理和可视化全部完成！")
-    print(f"👉 可视化图片文件夹: {vis_dir}")
-    print(f"👉 详细指标数据: {csv_path}")
-    print(f"👉 平均性能总结: {txt_path}")
-    print(f"   平均 Pd: {avg_pd:.4f} | 平均 Pfa: {avg_pfa:.6f} | 平均倒角距离: {avg_cd:.4f}")
+    # print(f"👉 可视化图片文件夹: {vis_dir}")
+    # print(f"👉 详细指标数据: {csv_path}")
+    # print(f"👉 平均性能总结: {txt_path}")
+    # print(f"   平均 Pd: {avg_pd:.4f} | 平均 Pfa: {avg_pfa:.6f} | 平均倒角距离: {avg_cd:.4f}")
 
 if __name__ == "__main__":
     main()

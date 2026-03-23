@@ -82,19 +82,20 @@ class RaDelftWrapper(Dataset):
 def main():
     parser = argparse.ArgumentParser(description='训练脚本')
     parser.add_argument('--use_radelft', default=True ,action='store_true', help='使用真实的 RaDelft 数据集')
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--range_bins', type=int, default=512)
     parser.add_argument('--doppler_bins', type=int, default=128)
     parser.add_argument('--angle_bins', type=int, default=256)
-    
+    parser.add_argument('--name', type=str, default='first_try')
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    
+    parser.add_argument('--workers', type=int, default=8)
+
     args = parser.parse_args()
     
-    wandb.init(project="hpc-network-test", name="first-try")
+    wandb.init(project="hpc-network-test", name=args.name)
 
     print("="*70)
     print("启动2d训练")
@@ -124,8 +125,8 @@ def main():
     #     train_dataset = SafeMockDataset(num_samples=200, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
     #     val_dataset = SafeMockDataset(num_samples=40, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16 if args.device=='cuda' else 0)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers if args.device=='cuda' else 0)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,num_workers=args.workers if args.device=='cuda' else 0)
     
     # 2. model
     # model = FastFusionModel(
@@ -142,7 +143,7 @@ def main():
     
     # 4. optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4) # AdamW 比 Adam 更利于泛化
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
 
 
     
@@ -151,6 +152,12 @@ def main():
     # break to test validation loop
     # step=0
 
+    kernel_size=[1, 5]
+    sigma=[0.1, 2.0]
+    dummy_point = torch.zeros(1, 1, 31, kernel_size[1])
+    dummy_point[0, 0, 15, kernel_size[1]//2] = 1.0
+    # 获取孤立单点模糊后的最大值 (比如 0.4)
+    W_c = TF.gaussian_blur(dummy_point, kernel_size=kernel_size, sigma=sigma).max()
     # 5. training loop
     for epoch in range(args.num_epochs):
         model.train()
@@ -178,10 +185,13 @@ def main():
             # radar_energy = outputs['ra_energy'][..., :-12, 8:-8]
             occupancy_target = occupancy_target.unsqueeze(1) #(B, 1, R, A)
             soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
-            batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
-            batch_max = batch_max.view(-1, 1, 1, 1)
-            soft_targets_norm = soft_targets / (batch_max + 1e-8)
-            soft_targets = soft_targets_norm.squeeze(1) #(B, R, A)
+            scaled=soft_targets / W_c
+            soft_targets = torch.clamp(scaled, min=0, max=1.0)  # 将
+            final_targets = torch.max(occupancy_target, soft_targets)
+            # batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
+            # batch_max = batch_max.view(-1, 1, 1, 1)
+            # soft_targets_norm = soft_targets / (batch_max + 1e-8)
+            soft_targets = final_targets.squeeze(1) #(B, R, A)
 
 
 
@@ -243,10 +253,13 @@ def main():
 
                 occupancy_target = occupancy_target_2d.unsqueeze(1) #(B, 1, R, A)
                 soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
-                batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
-                batch_max = batch_max.view(-1, 1, 1, 1)
-                soft_targets_norm = soft_targets / (batch_max + 1e-8)
-                soft_targets = soft_targets_norm.squeeze(1) #(B, R, A)
+                # batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
+                # batch_max = batch_max.view(-1, 1, 1, 1)
+                # soft_targets_norm = soft_targets / (batch_max + 1e-8)
+                scaled=soft_targets / W_c
+                soft_targets = torch.clamp(scaled, min=0, max=1.0)  # 将
+                final_targets = torch.max(occupancy_target, soft_targets)
+                soft_targets = final_targets.squeeze(1) #(B, R, A)
                 
                 
 
@@ -264,7 +277,7 @@ def main():
                 occupancy_logits=occupancy_logits.unsqueeze(1) #(B, 1, R, A)
                 pred=1.0-occupancy_logits
                 bgenergy=pred*radar_energy
-                print(f"radar_energy.shape: {radar_energy.shape} | bgenergy.shape: {bgenergy.shape}, occupancy_logits.shape: {occupancy_logits.shape}")
+                # print(f"radar_energy.shape: {radar_energy.shape} | bgenergy.shape: {bgenergy.shape}, occupancy_logits.shape: {occupancy_logits.shape}")
                 kernel_size = 5
                 pad = kernel_size // 2
             
@@ -280,7 +293,7 @@ def main():
 
                 
                 final_pred_2d = final_pred_2d.squeeze()
-                print(f"final_pred_2d.shape: {final_pred_2d.shape}")
+                # print(f"final_pred_2d.shape: {final_pred_2d.shape}")
                 # B, R, A = final_pred_2d.shape
                 max_doppler_idx=outputs['max_indices'][:, :-12, 8:-8] #(B, 500, 240)
                 # max_doppler_idx = torch.argmax(radar_cube_real, dim=2)#(B, 500, 240)
