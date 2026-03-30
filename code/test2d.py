@@ -116,7 +116,7 @@ def main():
     params["test_scenes"] = [2, 6]  # 仅测试集
     
     test_dataset = RaDelftTestWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8)
 
     # 3. 初始化模型并加载权重
     model = MaxPower2DModel(in_channels=2).to(args.device)
@@ -130,16 +130,63 @@ def main():
     
     model.eval()
 
-    # 4. 指标统计列表
+    #CFAR 参数设置
+    cfar_win_size = 7      # 
+    cfar_guard_size = 3     # 
+
+    cfar_kernel = torch.ones((1, 1, cfar_win_size, cfar_win_size), dtype=torch.float32, device=args.device)
+
+    center = cfar_win_size // 2
+    g_half = cfar_guard_size // 2
+    cfar_kernel[:, :, center-g_half : center+g_half+1, center-g_half : center+g_half+1] = 0
+
+    num_train_cells = cfar_kernel.sum().item()
+    cfar_alpha = 1.5
+    pad_cfar = cfar_win_size // 2
+
+
+    #oscfar 参数设置
+    os_win_size = 5      # 
+    os_pad = os_win_size // 2
+
+    # 1. 创建一个全 True 的 2D 掩码
+    mask_2d = torch.ones((os_win_size, os_win_size), dtype=torch.bool, device=args.device)
+
+    # 2. 把中心的保护单元和 CUT 挖空 (设为 False)
+    center = os_win_size // 2
+    mask_2d[center : center+1, center : center+1] = False
+
+    # 3. 展平为 1D 掩码 (长度为 25)
+    train_mask = mask_2d.flatten()
+    num_train_cells = train_mask.sum().item()
+
+    # 4. 确定 OS-CFAR 的排序索引 k (通常取 0.75 * N)
+    # 意思是：从小到大排序，取第 75% 位置的值作为纯净背景代表
+    k_index = int(0.75 * num_train_cells)
+
+    print(f"✅ OS-CFAR 初始化: 窗口={os_win_size}x{os_win_size}, 训练单元数={num_train_cells}, k取值={k_index}")
+
+
+
+
+
+
+
+
+
+
+
+
+    # 4. 
     metrics_records = []
-    test_alphas = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
-    # 5. 推理循环
+    test_alphas = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+    # 5. 
     with torch.no_grad():
         for batch_idx, batch_data in enumerate(tqdm(test_loader, desc="Testing & Plotting")):
             radar_cube = batch_data['radar_cube'].to(args.device)
             occupancy_target = batch_data['occupancy_target']
             
-            # 压缩 Z 轴 -> 2D GT
+            # 2D GT
             occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
             occupancy_target_2d = occupancy_target_2d.to(args.device)
             
@@ -161,22 +208,28 @@ def main():
             # 计算局部背景噪声
             kernel_size = 5
             pad = kernel_size // 2
-            local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
+            unfolded = F.unfold(bgenergy, kernel_size=os_win_size, padding=os_pad)
+            valid_cells = unfolded[:, train_mask, :]
+            local_bg_noise_sum, _ = torch.kthvalue(valid_cells, k_index, dim=1)
+            local_bg_noise_sum = local_bg_noise_sum.view(1, 1, 500, 240)
+            # local_bg_noise_sum = F.conv2d(bgenergy, cfar_kernel, stride=1, padding=pad_cfar)
+            # local_bg_weight_sum = local_bg_noise_sum / (num_train_cells) 
+            # local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
+            # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
+
+            # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
             
-            # 最终的二值化预测
-            # alpha = 5.0
-            # final_pred_2d = radar_energy_4d > (alpha * local_bg_noise_sum)
             
-            # ==============================
-            # 数据转换为 Numpy (去除 B 和 C 维度)
-            # ==============================
+           
+            # 转换为 Numpy 
+           
             gt_np = occupancy_target_2d.squeeze().cpu().numpy()
             radar_energy_np = radar_energy_4d.squeeze().cpu().numpy()
             pred_np = pred.squeeze().cpu().numpy()
             bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
             # final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
 
-            # 获取元数据信息用于命名
+            # 命名
             meta = batch_data['metadata']
             scene_id = meta.get('scene', [f'unk_{batch_idx}'])[0]
             if isinstance(scene_id, torch.Tensor): scene_id = scene_id.item()
@@ -205,6 +258,22 @@ def main():
                     'Chamfer_Dist': cd_val
                 })
 
+            cfar_noise_sum = F.conv2d(radar_energy_4d, cfar_kernel, padding=pad_cfar)
+            cfar_noise_mean = cfar_noise_sum / num_train_cells
+            cfar_pred = (radar_energy_4d > (cfar_alpha * cfar_noise_mean))
+            cfar_pred_np = cfar_pred.squeeze().cpu().numpy().astype(np.float32)
+            cfar_pd, cfar_pfa = compute_pd_pfa(gt_np, cfar_pred_np)
+            cfar_cd = compute_chamfer_distance_2d(gt_np, cfar_pred_np)
+            print(f"{title_info} -> CFAR (alpha={cfar_alpha}): Pd: {cfar_pd:.4f}, Pfa: {cfar_pfa:.6f}, Chamfer Dist: {cfar_cd:.4f}",flush=True)
+            metrics_records.append({
+                'Alpha': f'CFAR_{cfar_alpha}',
+                'Scene': scene_id,
+                'Frame': frame_id,
+                'Pd': cfar_pd,
+                'Pfa': cfar_pfa,
+                'Chamfer_Dist': cfar_cd 
+            })
+
             
 
     # ==============================
@@ -212,7 +281,7 @@ def main():
     # ==============================
     df_metrics = pd.DataFrame(metrics_records)
     
-    # 过滤掉 Chamfer Distance 计算中的 NaN (比如 GT 或 Pred 全黑的情况)
+    # 
     valid_cd = df_metrics['Chamfer_Dist'].dropna()
     avg_cd = valid_cd.mean() if not valid_cd.empty else float('nan')
     
@@ -220,7 +289,7 @@ def main():
     avg_pfa = df_metrics['Pfa'].mean()
     
     # 保存 CSV
-    csv_path = os.path.join(args.output_dir, "metrics_report323.csv")
+    csv_path = os.path.join(args.output_dir, "metrics_report324c.csv")
     df_metrics.to_csv(csv_path, index=False)
     
     # 保存 TXT Summary

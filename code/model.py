@@ -199,7 +199,7 @@ class DecoderNode(nn.Module):
         return self.block(x)
 
 class CustomResNet18Encoder(nn.Module):
-    """提取 ResNet18 的 5 个阶段特征，并修改第一层以支持 2 通道输入"""
+    """"""
     def __init__(self, in_channels=2, pretrained=True):
         super().__init__()
         base_model = torchvision.models.resnet18(pretrained=pretrained)
@@ -247,8 +247,7 @@ class CustomUNetPlusPlus(nn.Module):
         super().__init__()
         self.encoder = CustomResNet18Encoder(in_channels=in_channels, pretrained=True)
         
-        # ResNet18 各层输出通道数: [64, 64, 128, 256, 512]
-        # 定义解码层输出通道数 (可以根据需要调整，这里仿照标准结构)
+        # 
         ch = [32, 64, 128, 256] 
         
         # ---------------------------------------------------------
@@ -300,7 +299,7 @@ class CustomUNetPlusPlus(nn.Module):
         # Column 4
         x0_4 = self.node_0_4(up_x=x1_3, skip_xs=[x0_0, x0_1, x0_2, x0_3])
 
-        # 恢复到原分辨率
+        #
         out = self.final_up(x0_4)
         out = self.final_conv(out)
         

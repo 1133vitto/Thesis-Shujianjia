@@ -95,7 +95,7 @@ def main():
 
     args = parser.parse_args()
     
-    wandb.init(project="hpc-network-test", name=args.name)
+    wandb.init(project="model v1.0", name=args.name)
 
     print("="*70)
     print("启动2d训练")
@@ -138,6 +138,8 @@ def main():
         in_channels=2
     ).to(args.device)
     
+    # model.unet.freeze_backbone()
+
     # 3.  Loss
     criterion = RadarFusionLoss(weight_focal=1.0)
     
@@ -219,7 +221,7 @@ def main():
                 'Foc': f"{loss_dict['focal_loss'].item():.3f}",
                 # 'Qnt': f"{loss_dict['quantile_loss'].item():.3f}"
             })
-            wandb.log({"epoch": epoch, "loss": loss})
+            # wandb.log({"epoch": epoch, "loss": loss})
             # step+=1
             # if step>3:
             #     break  # Only run a few batches to test the validation loop. delete this line during formal training.
@@ -283,11 +285,11 @@ def main():
             
                 # avg pooling to get local background noise sum
                 local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
-                # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
+                local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
 
-                # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
+                local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
                 alpha=2.0
-                final_pred_2d = radar_energy > (alpha * local_bg_noise_sum)
+                final_pred_2d = radar_energy > (alpha * local_bg_noise_mean)
                 # qpred=radar_energy > qback_est
 
 
@@ -333,6 +335,16 @@ def main():
         print(f"\n[Validation Result] -> Average Pd: {mean_pd:.4f} | Average Pfa: {mean_pfa:.4f}")
         print(f" Epoch [{epoch+1}] Summary | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         
+        wandb.log({
+            "epoch": epoch + 1,  # 统一的 X 轴
+            "Loss/Train": avg_train_loss,
+            "Loss/Validation": avg_val_loss,
+            "Metrics/Pd": mean_pd,
+            "Metrics/Pfa": mean_pfa,
+            "Learning_Rate": optimizer.param_groups[0]['lr'] # 顺手记录一下学习率的变化！
+        })
+
+
         # save the parameters of the best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -351,11 +363,9 @@ def main():
             # save_path = os.path.join(args.save_dir, "best_fusion_model.pth")
             # torch.save(model.state_dict(), save_path)
             # print(f" 新的最佳模型已保存 -> {save_path}")
-        scheduler.step(avg_val_loss)
-        # 如果有外部 Evaluator，可以在每个 Epoch 末尾调用它算 AP / F1
-        # if HAS_EXTERNAL_EVALUATOR and (epoch + 1) % 5 == 0:
-        #     evaluator = Evaluator()
-        #     evaluator.evaluate(model, val_loader, args.device)
+        # scheduler.step(avg_val_loss) # if ReduceLROnPlateau 
+        scheduler.step() # if CosineAnnealingLR
+        
 
     print("\n 训练圆满结束！")
 
