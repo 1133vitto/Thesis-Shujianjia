@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
 import pandas as pd
+from scipy.spatial import cKDTree
+from sklearn.neighbors import KDTree
 
 # 路径设置，与你的训练脚本保持一致
 current_dir = Path(__file__).resolve().parent
@@ -24,23 +26,30 @@ from scipy.ndimage import distance_transform_edt
 # ==========================================
 # 辅助函数：计算 Chamfer Distance (2D)
 # ==========================================
-def compute_chamfer_distance_2d(gt_mask, pred_mask):
+def compute_chamfer_distance_2d(gt_pc, pred_pc):
     """
-    极速版倒角距离：使用 scipy.ndimage.distance_transform_edt
-    耗时不到 10 毫秒
+    物理级倒角距离 (单位: 米)
+    输入: gt_pc, pred_pc (N, 2) 形状的 numpy 数组，包含绝对物理坐标 [X, Y]
+    速度: 使用 cKDTree，C语言底层实现，极速查询。
     """
-    if not np.any(gt_mask) or not np.any(pred_mask):
+    # 防御性编程：如果没有任何预测或真实目标，返回 NaN
+    if len(gt_pc) == 0 or len(pred_pc) == 0:
         return np.nan
 
-    # 计算背景像素到最近目标的距离
-    dist_to_gt = distance_transform_edt(1 - gt_mask)
-    dist_to_pred = distance_transform_edt(1 - pred_mask)
+    # 1. 构建 KD 树 (空间索引建立)
+    tree_gt = cKDTree(gt_pc)
+    tree_pred = cKDTree(pred_pc)
 
-    # 提取有目标的像素位置的最短距离并求平均
-    mean_dist_pred_to_gt = np.mean(dist_to_gt[pred_mask > 0])
-    mean_dist_gt_to_pred = np.mean(dist_to_pred[gt_mask > 0])
+    # 2. 查询最近邻距离 (米)
+    # query 返回两个数组：距离数组，和对应的索引数组(这里用 _ 忽略)
+    dist_pred_to_gt, _ = tree_gt.query(pred_pc)
+    dist_gt_to_pred, _ = tree_pred.query(gt_pc)
 
-    return (mean_dist_pred_to_gt + mean_dist_gt_to_pred) / 2.0
+    # 3. 提取均值并求倒角距离
+    mean_dist_pred_to_gt = np.mean(dist_pred_to_gt)
+    mean_dist_gt_to_pred = np.mean(dist_gt_to_pred)
+
+    return (mean_dist_pred_to_gt + mean_dist_gt_to_pred)
 # def compute_chamfer_distance_2d(gt_mask, pred_mask):
 #     """
 #     计算二值图上的倒角距离。
@@ -109,6 +118,26 @@ def main():
     print(f" 结果保存至: {args.output_dir}")
     print("="*70)
 
+    # Range Axis
+    range_cell_size = 0.1004
+    # MATLAB: rangeCellSize:rangeCellSize:51.4242
+    range_axis_full = np.arange(range_cell_size, 51.4242 + 1e-5, range_cell_size)
+    # MATLAB 索引 11:end-2 对应 Python 索引 10:-2
+    range_axis = range_axis_full[10:-2] 
+
+    # Azimuth Axis
+    angle_fft_size = 256
+    # MATLAB: -pi:2*pi/(angleFFTSize-1):pi 
+    wx_vec_full = np.linspace(-np.pi, np.pi, angle_fft_size)
+    wx_vec_full = wx_vec_full[::-1] # flip
+    # MATLAB 索引 9:248 对应 Python 索引 8:247
+    wx_vec = wx_vec_full[8:248]
+    # 防御性编程：避免因浮点精度导致超出 [-1, 1] 使得 arcsin 报错出现 NaN
+    sin_theta = np.clip(wx_vec / (2 * np.pi * 0.4972), -1.0, 1.0)
+    azimuth_axis = np.arcsin(sin_theta)
+
+
+
     # 2. 准备数据集 (使用 batch_size=1 以便逐帧画图)
     params = data_preparation.get_default_params()
     params["dataset_path"] = '/scratch/shujianjia/dataset/'
@@ -141,7 +170,7 @@ def main():
     cfar_kernel[:, :, center-g_half : center+g_half+1, center-g_half : center+g_half+1] = 0
 
     num_train_cells = cfar_kernel.sum().item()
-    cfar_alpha = 1.5
+    cfar_alpha = 2.0
     pad_cfar = cfar_win_size // 2
 
 
@@ -166,7 +195,9 @@ def main():
 
     print(f"✅ OS-CFAR 初始化: 窗口={os_win_size}x{os_win_size}, 训练单元数={num_train_cells}, k取值={k_index}")
 
-
+    THETA, R = np.meshgrid(azimuth_axis, range_axis)
+    X = R * np.sin(THETA)
+    Y = R * np.cos(THETA)
 
 
 
@@ -208,13 +239,14 @@ def main():
             # 计算局部背景噪声
             kernel_size = 5
             pad = kernel_size // 2
-            unfolded = F.unfold(bgenergy, kernel_size=os_win_size, padding=os_pad)
-            valid_cells = unfolded[:, train_mask, :]
-            local_bg_noise_sum, _ = torch.kthvalue(valid_cells, k_index, dim=1)
-            local_bg_noise_sum = local_bg_noise_sum.view(1, 1, 500, 240)
+            bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
+            # unfolded = F.unfold(bgenergy, kernel_size=os_win_size, padding=os_pad)
+            # valid_cells = unfolded[:, train_mask, :]
+            # local_bg_noise_sum, _ = torch.kthvalue(valid_cells, k_index, dim=1)
+            # local_bg_noise_sum = local_bg_noise_sum.view(1, 1, 500, 240)
             # local_bg_noise_sum = F.conv2d(bgenergy, cfar_kernel, stride=1, padding=pad_cfar)
             # local_bg_weight_sum = local_bg_noise_sum / (num_train_cells) 
-            # local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
+            local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
             # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
 
             # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
@@ -242,10 +274,19 @@ def main():
             # 指标计算
             # ==============================
             for current_alpha in test_alphas:
+                break
                 final_pred_2d = radar_energy_np > (current_alpha * bg_noise_np)
                 final_pred_np = final_pred_2d.squeeze().astype(np.float32)
                 pd_val, pfa_val = compute_pd_pfa(gt_np, final_pred_np)
-                cd_val = compute_chamfer_distance_2d(gt_np, final_pred_np)
+
+                pred_pc_x = X[final_pred_np>0.5]
+                pred_pc_y = Y[final_pred_np>0.5]
+
+                gt_pc_x = X[gt_np>0.5]
+                gt_pc_y = Y[gt_np>0.5]
+                gt_pc_array = np.column_stack((gt_pc_x, gt_pc_y))
+                pred_pc_array = np.column_stack((pred_pc_x, pred_pc_y))
+                cd_val = compute_chamfer_distance_2d(gt_pc_array, pred_pc_array)
                 print(f"{title_info} -> alpha: {current_alpha}, Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}",flush=True)
 
                 tqdm.write(f"{title_info} -> alpha: {current_alpha}, Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}")
@@ -258,12 +299,33 @@ def main():
                     'Chamfer_Dist': cd_val
                 })
 
-            cfar_noise_sum = F.conv2d(radar_energy_4d, cfar_kernel, padding=pad_cfar)
-            cfar_noise_mean = cfar_noise_sum / num_train_cells
+
+
+            ###cfar ososos
+            gt_pc_x = X[gt_np>0.5]
+            gt_pc_y = Y[gt_np>0.5]
+            gt_pc_array = np.column_stack((gt_pc_x, gt_pc_y))
+            radar_energy_pad= F.pad(radar_energy_4d, (os_pad, os_pad, os_pad, os_pad), mode='replicate')
+            unfolded = F.unfold(radar_energy_pad, kernel_size=os_win_size, padding=0)
+            valid_cells = unfolded[:, train_mask, :]
+            cfar_noise_mean, _ = torch.kthvalue(valid_cells, k_index, dim=1)
+            cfar_noise_mean = cfar_noise_mean.view(1, 1, 500, 240)
             cfar_pred = (radar_energy_4d > (cfar_alpha * cfar_noise_mean))
+
+            # radar_energy_pad= F.pad(radar_energy_4d, (pad_cfar, pad_cfar, pad_cfar, pad_cfar), mode='replicate')    
+            # cfar_noise_sum = F.conv2d(radar_energy_pad, cfar_kernel, padding=0)
+            # cfar_noise_mean = cfar_noise_sum / num_train_cells
+            ###cfar ososos
+            
+            
             cfar_pred_np = cfar_pred.squeeze().cpu().numpy().astype(np.float32)
             cfar_pd, cfar_pfa = compute_pd_pfa(gt_np, cfar_pred_np)
-            cfar_cd = compute_chamfer_distance_2d(gt_np, cfar_pred_np)
+
+            cfar_pred_pc_x = X[cfar_pred_np>0.5]
+            cfar_pred_pc_y = Y[cfar_pred_np>0.5]
+            cfar_pred_pc_array = np.column_stack((cfar_pred_pc_x, cfar_pred_pc_y))  
+
+            cfar_cd = compute_chamfer_distance_2d(gt_pc_array, cfar_pred_pc_array)
             print(f"{title_info} -> CFAR (alpha={cfar_alpha}): Pd: {cfar_pd:.4f}, Pfa: {cfar_pfa:.6f}, Chamfer Dist: {cfar_cd:.4f}",flush=True)
             metrics_records.append({
                 'Alpha': f'CFAR_{cfar_alpha}',
@@ -289,7 +351,7 @@ def main():
     avg_pfa = df_metrics['Pfa'].mean()
     
     # 保存 CSV
-    csv_path = os.path.join(args.output_dir, "metrics_report324c.csv")
+    csv_path = os.path.join(args.output_dir, "metrics_report331a.csv")
     df_metrics.to_csv(csv_path, index=False)
     
     # 保存 TXT Summary
