@@ -98,13 +98,13 @@ class old2DModel(nn.Module):
         x = torch.cat([max_power, max_indices_norm], dim=1)
         
         
-        logits = self.unet(x) 
-        logits = torch.sigmoid(logits)
-        
+        logits = self.unet(x)  # raw logits
+
         return {
-            'occupancy_logits': logits.squeeze(), # (B, R, A)
-            'ra_energy': max_power,                # (B, 1,R, A)
-            'max_indices': max_indices             # (B,1, R, A)
+            'occupancy_prob': torch.sigmoid(logits).squeeze(),  # (B, R, A) - probability for detection
+            'occupancy_logits': logits.squeeze(),              # (B, R, A) - raw logits for loss
+            'ra_energy': max_power,                           # (B, 1, R, A)
+            'max_indices': max_indices                        # (B, R, A)
         }
 
 
@@ -150,13 +150,13 @@ class MaxPower2DModel(nn.Module):
         x = torch.cat([max_power, max_indices_norm], dim=1)
         
         
-        logits = self.unet(x) 
-        logits = torch.sigmoid(logits)
-        
+        logits = self.unet(x)  # raw logits
+
         return {
-            'occupancy_logits': logits.squeeze(), # (B, R, A)
-            'ra_energy': max_power,                # (B, 1,R, A)
-            'max_indices': max_indices             # (B,1, R, A)
+            'occupancy_prob': torch.sigmoid(logits).squeeze(),  # (B, R, A) - probability for detection
+            'occupancy_logits': logits.squeeze(),              # (B, R, A) - raw logits for loss
+            'ra_energy': max_power,                           # (B, 1, R, A)
+            'max_indices': max_indices                        # (B, R, A)
         }
 
 

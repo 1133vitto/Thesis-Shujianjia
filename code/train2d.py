@@ -141,7 +141,7 @@ def main():
     # model.unet.freeze_backbone()
 
     # 3.  Loss
-    criterion = RadarFusionLoss(weight_focal=1.0)
+    criterion = RadarFusionLoss(weight_focal=1.0, weight_dice=0.1)
     
     # 4. optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4) # AdamW 比 Adam 更利于泛化
@@ -179,10 +179,8 @@ def main():
             
             # forward
             outputs = model(radar_cube)
-            occupancy_logits = outputs['occupancy_logits'][:, :-12, 8:-8]
-            radar_energy = outputs['ra_energy'][:, :-12, 8:-8]
-            # quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
-            # occupancy_logits = outputs['occupancy_logits'][..., :-12, 8:-8]
+            occupancy_prob = outputs['occupancy_prob'][:, :-12, 8:-8]
+            radar_energy = outputs['ra_energy'][:, :, :-12, 8:-8]#( B, 1, R, A  )
             # quantile_preds = outputs['quantiles'][..., :-12, 8:-8]
             # radar_energy = outputs['ra_energy'][..., :-12, 8:-8]
             occupancy_target = occupancy_target.unsqueeze(1) #(B, 1, R, A)
@@ -200,7 +198,7 @@ def main():
 
 
             loss_dict = criterion(
-                occupancy_logits=occupancy_logits, 
+                occupancy_prob=occupancy_prob,
                 # quantile_preds=quantile_preds,
                 occupancy_target=soft_targets,
                 radar_energy=radar_energy
@@ -219,6 +217,8 @@ def main():
             pbar.set_postfix({
                 'Tot': f"{loss.item():.3f}",
                 'Foc': f"{loss_dict['focal_loss'].item():.3f}",
+                'Dice': f"{loss_dict['dice_loss'].item():.3f}",
+                'CFAR': f"{loss_dict['cfar_loss'].item():.3f}",
                 # 'Qnt': f"{loss_dict['quantile_loss'].item():.3f}"
             })
             # wandb.log({"epoch": epoch, "loss": loss})
@@ -246,9 +246,9 @@ def main():
                 outputs = model(radar_cube)
                 
                 occupancy_logits = outputs['occupancy_logits'][:,  :-12, 8:-8]
+                occupancy_prob = outputs['occupancy_prob'][:, :-12, 8:-8]
                 radar_energy = outputs['ra_energy'][:, :, :-12, 8:-8]
-                # occupancy=outputs['occupancy'][:, :-12, 8:-8]
-                # quantile_preds = outputs['quantiles'][:, :-12, 8:-8, :]
+                
                 # qback_est=outputs['background_est'][:, :-12, 8:-8]
 
                 radar_cube_real = radar_cube[:, :-12, :, 8:-8]
@@ -269,15 +269,14 @@ def main():
 
 
                 loss_dict = criterion(
-                occupancy_logits=occupancy_logits, 
+                occupancy_prob=occupancy_prob,
                 # quantile_preds=quantile_preds,
                 occupancy_target=soft_targets,
                 radar_energy=radar_energy
                 )
                 total_val_loss += loss_dict['total_loss'].item()
 
-                occupancy_logits=occupancy_logits.unsqueeze(1) #(B, 1, R, A)
-                pred=1.0-occupancy_logits
+                pred=1.0-occupancy_prob.unsqueeze(1)
                 bgenergy=pred*radar_energy
                 # print(f"radar_energy.shape: {radar_energy.shape} | bgenergy.shape: {bgenergy.shape}, occupancy_logits.shape: {occupancy_logits.shape}")
                 kernel_size = 5
@@ -285,21 +284,20 @@ def main():
             
                 # avg pooling to get local background noise sum
                 local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
-                local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
+                # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
 
-                local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
+                # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
                 alpha=2.0
-                final_pred_2d = radar_energy > (alpha * local_bg_noise_mean)
-                # qpred=radar_energy > qback_est
+                final_pred_2d = radar_energy > (alpha * local_bg_noise_sum)
+                
 
 
                 
                 final_pred_2d = final_pred_2d.squeeze()
-                # print(f"final_pred_2d.shape: {final_pred_2d.shape}")
                 # B, R, A = final_pred_2d.shape
                 max_doppler_idx=outputs['max_indices'][:, :-12, 8:-8] #(B, 500, 240)
                 # max_doppler_idx = torch.argmax(radar_cube_real, dim=2)#(B, 500, 240)
-                
+
 
                 gt_2d_numpy = occupancy_target_2d.cpu().detach().numpy()
                 pred_2d_numpy = final_pred_2d.cpu().detach().numpy()

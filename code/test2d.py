@@ -225,7 +225,7 @@ def main():
             outputs = model(radar_cube)
             
             # 维度截取 (根据你验证集的代码逻辑)
-            occupancy_logits = outputs['occupancy_logits'].unsqueeze(0) # (B, 1, R, A)
+            occupancy_logits = outputs['occupancy_prob'].unsqueeze(0) # (B,  R, A)
             occupancy_logits = occupancy_logits[:, :-12, 8:-8]
             radar_energy = outputs['ra_energy'][:, :-12, 8:-8] if outputs['ra_energy'].dim() == 3 else outputs['ra_energy'][:, 0, :-12, 8:-8]
             
@@ -233,20 +233,20 @@ def main():
             radar_energy_4d = radar_energy.unsqueeze(1)      # (B, 1, R, A)
             
             # 计算 pred 和 bgenergy
-            pred = 1.0 - occupancy_logits
-            bgenergy = pred * radar_energy_4d
+            #pred = 1.0 - occupancy_logits
+            #bgenergy = pred * radar_energy_4d
             
             # 计算局部背景噪声
             kernel_size = 5
             pad = kernel_size // 2
-            bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
+            #bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
             # unfolded = F.unfold(bgenergy, kernel_size=os_win_size, padding=os_pad)
             # valid_cells = unfolded[:, train_mask, :]
             # local_bg_noise_sum, _ = torch.kthvalue(valid_cells, k_index, dim=1)
             # local_bg_noise_sum = local_bg_noise_sum.view(1, 1, 500, 240)
             # local_bg_noise_sum = F.conv2d(bgenergy, cfar_kernel, stride=1, padding=pad_cfar)
             # local_bg_weight_sum = local_bg_noise_sum / (num_train_cells) 
-            local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
+            #local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
             # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
 
             # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
@@ -257,8 +257,8 @@ def main():
            
             gt_np = occupancy_target_2d.squeeze().cpu().numpy()
             radar_energy_np = radar_energy_4d.squeeze().cpu().numpy()
-            pred_np = pred.squeeze().cpu().numpy()
-            bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
+            #pred_np = pred.squeeze().cpu().numpy()
+            #bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
             # final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
 
             # 命名
@@ -274,9 +274,11 @@ def main():
             # 指标计算
             # ==============================
             for current_alpha in test_alphas:
-                break
-                final_pred_2d = radar_energy_np > (current_alpha * bg_noise_np)
-                final_pred_np = final_pred_2d.squeeze().astype(np.float32)
+                # break
+                # final_pred_2d = radar_energy_np > (current_alpha * bg_noise_np)
+                final_pred_2d = occupancy_logits>0.5
+                final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
+                # final_pred_np = final_pred_2d.squeeze().astype(np.float32)
                 pd_val, pfa_val = compute_pd_pfa(gt_np, final_pred_np)
 
                 pred_pc_x = X[final_pred_np>0.5]
@@ -298,6 +300,8 @@ def main():
                     'Pfa': pfa_val,
                     'Chamfer_Dist': cd_val
                 })
+                if current_alpha == 1.0:
+                    continue
 
 
 
@@ -351,7 +355,7 @@ def main():
     avg_pfa = df_metrics['Pfa'].mean()
     
     # 保存 CSV
-    csv_path = os.path.join(args.output_dir, "metrics_report331a.csv")
+    csv_path = os.path.join(args.output_dir, "408ablation1.csv")
     df_metrics.to_csv(csv_path, index=False)
     
     # 保存 TXT Summary

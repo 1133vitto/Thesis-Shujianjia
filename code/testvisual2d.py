@@ -129,7 +129,7 @@ def main():
     args = parser.parse_args()
     
     # 1. 创建输出目录
-    vis_dir = os.path.join(args.output_dir, 'visualizations401')
+    vis_dir = os.path.join(args.output_dir, 'visualizations401用331模型跑试试ablation')
     os.makedirs(vis_dir, exist_ok=True)
     
     # Range Axis
@@ -206,7 +206,7 @@ def main():
             outputs = model(radar_cube)
             
             # 维度截取 (根据你验证集的代码逻辑)
-            occupancy_logits = outputs['occupancy_logits'].unsqueeze(0) # (B, 1, R, A)
+            occupancy_logits = outputs['occupancy_prob'].unsqueeze(0) # (B, 1, R, A)
             occupancy_logits = occupancy_logits[:, :-12, 8:-8]
             radar_energy = outputs['ra_energy'][:, :-12, 8:-8] if outputs['ra_energy'].dim() == 3 else outputs['ra_energy'][:, 0, :-12, 8:-8]
             
@@ -261,6 +261,8 @@ def main():
             # ==============================
             # 数据转换为 Numpy (去除 B 和 C 维度)
             # ==============================
+            nndirect=occupancy_logits>0.5
+            nndirect=nndirect.squeeze().cpu().numpy()
             gt_np = occupancy_target_2d.squeeze().cpu().numpy()
             radar_energy_np = radar_energy_4d.squeeze().cpu().numpy()
             pred_np = pred.squeeze().cpu().numpy()
@@ -295,6 +297,9 @@ def main():
 
             cfar_pc_x = X[cfar_pred_np>0.5]
             cfar_pc_y = Y[cfar_pred_np>0.5]
+
+            nndirect_x=X[nndirect>0.5]
+            nndirect_y=Y[nndirect>0.5]
 
 
 
@@ -350,8 +355,15 @@ def main():
             # plt.colorbar(im1, ax=axd["pred_prob"], fraction=0.046, pad=0.04)
 
             #CFAR
-            axd["cfar_pred"].scatter(cfar_pc_x, cfar_pc_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
-            axd["cfar_pred"].set_title("CFAR Pred (Point Cloud)")
+            # axd["cfar_pred"].scatter(cfar_pc_x, cfar_pc_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
+            # axd["cfar_pred"].set_title("CFAR Pred (Point Cloud)")
+
+
+            axd["cfar_pred"].scatter(nndirect_x, nndirect_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
+            axd["cfar_pred"].set_title("nndirect")
+
+
+
 
             # 3. Local BG Noise Sum
             if args.test_version == '1.0':
