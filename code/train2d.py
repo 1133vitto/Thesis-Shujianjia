@@ -62,9 +62,42 @@ class RaDelftWrapper(Dataset):
         power_cube = np.transpose(power_cube, (1, 0, 2)) #  (512, 128, 256)
         # elevation_cube = np.transpose(elevation_cube, (1, 0, 2))
         
-        # 3. GT
+        range_cell_size = 0.1004
+        max_range = 51.4242
+        range_axis = np.arange(range_cell_size, max_range + range_cell_size, range_cell_size)
+        range_axis = range_axis[10:-3]
+        # Azimuth Axis 
+        angle_fft_size = 256 
+        wx_vec = np.linspace(-np.pi, np.pi, angle_fft_size) 
+        wx_vec = wx_vec[8:248] 
+        azimuth_axis = np.arcsin(wx_vec / (2 * np.pi * 0.4972))
+        # Elevation Axis 
+        ele_fft_size = 128 
+        wz_vec = np.linspace(-np.pi, np.pi, ele_fft_size) 
+        wz_vec = wz_vec[47:81] 
+        elevation_axis = np.arcsin(wz_vec / (2 * np.pi * 0.4972))
+
+        E = elevation_axis          # (34,)
+        R = range_axis             # (500,)
+        A = azimuth_axis           # (240,)
+
+        E_grid, R_grid, A_grid = np.meshgrid(E, R, A, indexing='ij')
+
+        # 坐标变换
+        Z = R_grid * np.sin(E_grid)
+        X = R_grid * np.cos(E_grid) * np.cos(A_grid)
+        Y = R_grid * np.cos(E_grid) * np.sin(A_grid)
+        z_min = -1.0   # 地面以下一点
+        z_max = 2.5    # SUV / truck 上限
+        mask = (Z >= z_min) & (Z <= z_max)
+        gt_filtered = gt_cube * mask
+
+
+
+        occupancy_target = np.max(gt_filtered, axis=0)  # (500, 240)
+        occupancy_target = (occupancy_target > 0).astype(np.float32)  # 二值化
         # 
-        occupancy_target = np.squeeze(gt_cube) 
+        occupancy_target = np.squeeze(occupancy_target) #(500, 240)
 
         
         return {
@@ -141,7 +174,7 @@ def main():
     # model.unet.freeze_backbone()
 
     # 3.  Loss
-    criterion = RadarFusionLoss(weight_focal=1.0, weight_dice=0.1)
+    criterion = RadarFusionLoss(weight_focal=1.0, weight_dice=0.0)
     
     # 4. optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4) # AdamW 比 Adam 更利于泛化
@@ -152,7 +185,7 @@ def main():
     best_val_loss = float('inf')
     
     # break to test validation loop
-    # step=0
+    step=0
 
     kernel_size=[1, 5]
     sigma=[0.1, 2.0]
@@ -184,6 +217,7 @@ def main():
             # quantile_preds = outputs['quantiles'][..., :-12, 8:-8]
             # radar_energy = outputs['ra_energy'][..., :-12, 8:-8]
             occupancy_target = occupancy_target.unsqueeze(1) #(B, 1, R, A)
+            # print(f"occupancy_target shape: {occupancy_target.shape}")
             soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
             scaled=soft_targets / W_c
             soft_targets = torch.clamp(scaled, min=0, max=1.0)  # 将
@@ -223,7 +257,7 @@ def main():
             })
             # wandb.log({"epoch": epoch, "loss": loss})
             # step+=1
-            # if step>3:
+            # if step>2:
             #     break  # Only run a few batches to test the validation loop. delete this line during formal training.
         avg_train_loss = total_train_loss / len(train_loader)
         
@@ -239,9 +273,10 @@ def main():
             for batch_data in val_loader:
                 radar_cube = batch_data['radar_cube'].to(args.device) # (B, 512, 128, 256)
                 occupancy_target = batch_data['occupancy_target']
-                occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
-                occupancy_target_2d=occupancy_target_2d.to(args.device)
-                occupancy_target_3d=occupancy_target.to(args.device)
+
+                # occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
+                occupancy_target_2d=occupancy_target.to(args.device)
+                # occupancy_target_3d=occupancy_target.to(args.device)
                 # occupancy_target = batch_data['occupancy_target'].to(args.device)
                 outputs = model(radar_cube)
                 
@@ -254,6 +289,7 @@ def main():
                 radar_cube_real = radar_cube[:, :-12, :, 8:-8]
 
                 occupancy_target = occupancy_target_2d.unsqueeze(1) #(B, 1, R, A)
+                # print(f"occupancy_target shape: {occupancy_target.shape}")
                 soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
                 # batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
                 # batch_max = batch_max.view(-1, 1, 1, 1)
@@ -315,6 +351,9 @@ def main():
                 # qpd_list.append(qpd)
                 # qpfa_list.append(qpfa)
                 count=count+1
+                # step+=1
+                # if step>3:
+                #     break  # Only run a few batches to test the validation loop. delete this line during formal training.
 
 
 

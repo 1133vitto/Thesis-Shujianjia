@@ -11,6 +11,8 @@ from scipy.spatial.distance import cdist
 import pandas as pd
 from scipy.spatial import cKDTree
 from sklearn.neighbors import KDTree
+from thop import profile
+from thop import clever_format
 
 # 路径设置，与你的训练脚本保持一致
 current_dir = Path(__file__).resolve().parent
@@ -22,7 +24,7 @@ from model import MaxPower2DModel, old2DModel
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 from radelft.utils.compute_metrics import compute_pd_pfa
 from radelft.data_preparation import data_preparation
-
+from train2d import RaDelftWrapper
 # ==========================================
 # 辅助函数：计算 Chamfer Distance (2D)
 # ==========================================
@@ -93,27 +95,27 @@ def compute_chamfer_distance_2d(gt_pc, pred_pc):
 
 
 
-class RaDelftTestWrapper(torch.utils.data.Dataset):
-    """
-    复用你的 Wrapper，专用于测试集
-    """
-    def __init__(self, mode='val', params=None):
-        self.real_dataset = RADCUBE_DATASET(mode=mode, params=params)
+# class RaDelftTestWrapper(torch.utils.data.Dataset):
+#     """
+#     复用你的 Wrapper，专用于测试集
+#     """
+#     def __init__(self, mode='val', params=None):
+#         self.real_dataset = RADCUBE_DATASET(mode=mode, params=params)
 
-    def __len__(self):
-        return len(self.real_dataset)
+#     def __len__(self):
+#         return len(self.real_dataset)
 
-    def __getitem__(self, idx):
-        input_cube, gt_cube, item_params = self.real_dataset[idx]
-        power_cube = input_cube[0]
-        power_cube = np.transpose(power_cube, (1, 0, 2))
-        occupancy_target = np.squeeze(gt_cube) 
+#     def __getitem__(self, idx):
+#         input_cube, gt_cube, item_params = self.real_dataset[idx]
+#         power_cube = input_cube[0]
+#         power_cube = np.transpose(power_cube, (1, 0, 2))
+#         occupancy_target = np.squeeze(gt_cube) 
         
-        return {
-            'radar_cube': torch.from_numpy(power_cube).float(),
-            'occupancy_target': torch.from_numpy(occupancy_target).float(),
-            'metadata': item_params  # 包含 scene / frame 信息
-        }
+#         return {
+#             'radar_cube': torch.from_numpy(power_cube).float(),
+#             'occupancy_target': torch.from_numpy(occupancy_target).float(),
+#             'metadata': item_params  # 包含 scene / frame 信息
+#         }
 
 # ==========================================
 # 推理与可视化主函数
@@ -129,7 +131,7 @@ def main():
     args = parser.parse_args()
     
     # 1. 创建输出目录
-    vis_dir = os.path.join(args.output_dir, 'visualizations401用331模型跑试试ablation')
+    vis_dir = os.path.join(args.output_dir, '422用420模型1跑中期图,18轮，size7,加NN')
     os.makedirs(vis_dir, exist_ok=True)
     
     # Range Axis
@@ -173,7 +175,7 @@ def main():
     params["train_val_scenes"] = [1, 3, 4, 5, 7]
     params["test_scenes"] = [2, 6]  # 仅测试集
     
-    test_dataset = RaDelftTestWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
+    test_dataset = RaDelftWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     # 3. 初始化模型并加载权重
@@ -188,7 +190,18 @@ def main():
         model.load_state_dict(checkpoint)
     
     model.eval()
+    dummy_input = torch.randn(1, 512, 128, 256)
+    macs, params = profile(model, inputs=(dummy_input, ))
 
+    # 4. 格式化输出，让它看起来更直观 (比如变成 M, G 等单位)
+    macs_formatted, params_formatted = clever_format([macs, params], "%.3f")
+
+    # 注意：硬件界通常将 1 MAC 近似等于 2 FLOPs (一次乘法+一次加法)
+    flops = macs * 2
+    flops_formatted, _ = clever_format([flops, params], "%.3f")
+    print(f"参数量 (Params): {params_formatted}")
+    print(f"计算量 (MACs): {macs_formatted}")
+    print(f"计算量 (FLOPs): {flops_formatted}")
     # 4. 指标统计列表
     metrics_records = []
     step=0
@@ -199,8 +212,8 @@ def main():
             occupancy_target = batch_data['occupancy_target']
             
             # 压缩 Z 轴 -> 2D GT
-            occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
-            occupancy_target_2d = occupancy_target_2d.to(args.device)
+            # occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
+            occupancy_target_2d = occupancy_target.to(args.device)
             
             # 模型前向传播
             outputs = model(radar_cube)
@@ -220,14 +233,14 @@ def main():
                 bgenergy = pred * radar_energy_4d
                 
                 # 计算局部背景噪声
-                kernel_size = 5
+                kernel_size = 7
                 pad = kernel_size // 2
                 bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
                 local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
                 # 最终的二值化预测首先尝试了 TopK 的方式，替换了原来的逻辑。
 
 
-                alpha = 2.0
+                alpha = 2
                 final_pred_2d = radar_energy_4d > (alpha * local_bg_noise_sum)
                 bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
             
@@ -354,7 +367,7 @@ def main():
             # axd["pred_prob"].set_title("Pred (Probability)")
             # plt.colorbar(im1, ax=axd["pred_prob"], fraction=0.046, pad=0.04)
 
-            #CFAR
+           # CFAR
             # axd["cfar_pred"].scatter(cfar_pc_x, cfar_pc_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
             # axd["cfar_pred"].set_title("CFAR Pred (Point Cloud)")
 
@@ -369,7 +382,7 @@ def main():
             if args.test_version == '1.0':
                 bg_noise_db = 10 * np.log10(bg_noise_np + 1e-9) + 39.54
                 im2 = axd["bg_noise"].pcolormesh(X, Y, bg_noise_db, cmap='jet', shading='gouraud')
-                axd["bg_noise"].set_title("Local BG Noise Sum")
+                axd["bg_noise"].set_title("Threshold")
                 plt.colorbar(im2, ax=axd["bg_noise"], fraction=0.046, pad=0.04)
 
             # 4. Final Pred 2D
