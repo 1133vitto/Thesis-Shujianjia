@@ -48,7 +48,7 @@ class RADCUBE_DATASET(Dataset):
             # Here it is assumed the folders structure is as given in the dataset.
             # If modified, this lines have to be changed, specially "Scene" "and RadarCubes"
             scene_dir = self.dataset_path + '/Scene' + str(scene_number)
-            cubes_dir = scene_dir + '/RadarCubes'
+            cubes_dir = scene_dir + '/RadarCubes3d'
             all_files = os.listdir(cubes_dir)
             power_files = [file for file in all_files if "Pow_Frame" in file]
             power_numbers = [int(file.split("_")[-1].split(".")[0]) for file in power_files]
