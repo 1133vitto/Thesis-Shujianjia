@@ -23,7 +23,7 @@ import torchvision.transforms.functional as TF
 import wandb
 
 from radelft.data_preparation import data_preparation
-from model import RadarResUNet
+from model import RadarResUNet3Plus
 from losses import focal_sam_loss
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 from scipy.spatial.distance import cdist
@@ -158,7 +158,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,num_workers=args.workers if args.device=='cuda' else 0)
     
 
-    model = RadarResUNet(
+    model = RadarResUNet3Plus(
         n_doppler=128,
         out_dim=32
     ).to(args.device)
@@ -260,7 +260,7 @@ def main():
 
         total_val_loss = 0.0
         pd_list, pfa_list,cd_list = [], [],[]
-        count = 0
+        # count = 0
 
         with torch.no_grad():
             for batch_data in tqdm(val_loader, desc="Validation", leave=False):
@@ -306,8 +306,9 @@ def main():
                 
                 pd_list.append(pd)
                 pfa_list.append(pfa)
+
                 # cd_list.append(cd)
-                step=step+1
+                # step=step+1
                 # if step>5:
                 #     break
 
@@ -336,6 +337,7 @@ def main():
             best_val_loss = avg_val_loss
             file_name = f"best_epoch_{epoch+1}_loss_{avg_val_loss:.4f}.pth"
             save_path = os.path.join(save_dir, file_name)
+            count=0
             
             # Save the complete state dictionary, including model weights and optimizer state
             checkpoint = {
@@ -346,6 +348,12 @@ def main():
             }
             torch.save(checkpoint, save_path)
             print(f" 新的最佳模型已保存 -> {save_path}")
+        else:
+            count+=1
+            print(f" 本轮验证损失未提升，当前连续未提升次数: {count}")
+            if count>=5:
+                print(" 验证损失连续5轮未提升，提前停止训练！")
+                break
             
         # scheduler.step(avg_val_loss) # if ReduceLROnPlateau 
         scheduler.step() # if CosineAnnealingLR

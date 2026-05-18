@@ -81,7 +81,7 @@ def main():
                             num_workers=args.workers if args.device == 'cuda' else 0)
 
     # 模型初始化，对齐 train2d.py
-    model = RadarResUNet(n_doppler=128, out_dim=16).to(args.device)
+    model = RadarResUNet(n_doppler=128, out_dim=32).to(args.device)
 
     checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
     if 'model_state_dict' in checkpoint:
@@ -91,7 +91,7 @@ def main():
     model.eval()
 
     # 阈值扫描
-    test_thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
+    test_thresholds = [0.8, 0.9,1.0,1.1,1.2]
     metrics_records = []
 
     with torch.no_grad():
@@ -153,7 +153,7 @@ def main():
 
     # 保存结果
     df_metrics = pd.DataFrame(metrics_records)
-    csv_path = os.path.join(args.output_dir, "502_results阈值小于1.csv")
+    csv_path = os.path.join(args.output_dir, "504_输出32维度results.csv")
     df_metrics.to_csv(csv_path, index=False)
 
     avg_pd = df_metrics['Pd'].mean()

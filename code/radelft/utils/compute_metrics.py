@@ -103,7 +103,7 @@ def compute_metrics_time(params):
 
             # Load radar point clouds
             cfar = dataset_dict[t]['cfar_path']
-            network_output = cfar.replace('radar_ososos', 'network')
+            network_output = cfar.replace('radar_ososos', 'network2d')
             if not os.path.isfile(network_output):
                 continue
             radarpc = np.load(network_output)
@@ -181,6 +181,6 @@ def compute_pd_pfa(ground_truth, prediction):
 
     # Compute True Positive Rate (TPR) and False Positive Rate (FPR)
     TPR = TP / (TP + FN) if (TP + FN) > 0 else 0
-    FPR = FP / (FP + (ground_truth_flat.size - TP - FN)) if (FP + (ground_truth_flat.size - TP - FN)) > 0 else 0
+    FPR = FP /  (ground_truth_flat.size - TP - FN) if (ground_truth_flat.size - TP - FN) > 0 else 0
 
     return TPR, FPR

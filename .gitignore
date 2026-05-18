@@ -49,3 +49,5 @@ Thumbs.db
 /code/results/
 /code/checkpoints/
 /code/wandb/
+/code/radelft/networks/lightning_logs/
+project.md

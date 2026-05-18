@@ -143,7 +143,7 @@ def main(params):
 
     # Create training and validation data loaders
     num_workers = 8
-    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=num_workers, pin_memory=False)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=num_workers, pin_memory=False)
     val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=num_workers, pin_memory=False)
     model = NeuralNetworkRadarDetector("FPN", "resnet18", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
 
@@ -151,7 +151,7 @@ def main(params):
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        max_epochs=60,
+        max_epochs=50,
         callbacks=[checkpoint_callback, RichProgressBar(leave=True, theme=RichProgressBarTheme(metrics_format='.4e'))],
     )
     trainer.fit(
@@ -159,13 +159,17 @@ def main(params):
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
     )
+    best_model_path = checkpoint_callback.best_model_path
+    print(f"Training finished! Best model saved at: {best_model_path}")
+    return best_model_path
 
 
-def generate_point_clouds(params):
+def generate_point_clouds(params,checkpoint_path):
     # Load model
-    path = 'lightning_logs/version_36/checkpoints/epoch=13-step=22932.ckpt'
-
-    checkpoint = torch.load(path)
+    print(f"Starting inference using model: {checkpoint_path}")
+    
+    # 【修改】使用传入的路径
+    checkpoint = torch.load(checkpoint_path)
     model = NeuralNetworkRadarDetector("FPN", "resnet18", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
     model.load_state_dict(checkpoint['state_dict'])
     model.eval()
@@ -175,7 +179,7 @@ def generate_point_clouds(params):
     val_dataset = RADCUBE_DATASET_TIME(mode='test', params=params)
 
     # Create training and validation data loaders
-    num_workers = 16
+    num_workers = 8
     val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=num_workers, pin_memory=False)
 
     for batch in val_loader:
@@ -194,9 +198,9 @@ def generate_point_clouds(params):
                     radar_pc[:, 2] = -radar_pc[:, 2]
 
                     cfar_path = data_dict_t["cfar_path"][i]
-                    save_path = re.sub(r"radar_.+/", r"network/", cfar_path)
+                    save_path = re.sub(r"radar_.+/", r"network2d/", cfar_path)
                     print(save_path)
-
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
                     np.save(save_path, radar_pc)
 
 
@@ -204,7 +208,7 @@ if __name__ == "__main__":
     params = data_preparation.get_default_params()
 
     # Initialise parameters
-    params["dataset_path"] = "PATH_TO_DATASET"
+    params["dataset_path"] = '/scratch/shujianjia/dataset/'
     params["train_val_scenes"] = [1, 3, 4, 5, 7]
     params["test_scenes"] = [2, 6]
     params["train_test_split_percent"] = 0.8
@@ -213,8 +217,15 @@ if __name__ == "__main__":
     params["quantile"] = False
 
     # This train the NN
-    main(params)
+    best_ckpt_path = main(params)
 
+    if best_ckpt_path:
+        generate_point_clouds(params, best_ckpt_path)
+    else:
+        print("Error: No checkpoint was generated during training.")
+
+    # 第三步：如果有需要，再计算指标
+    compute_metrics_time(params)
     # This generate the poincloud from the trained NN
     # generate_point_clouds(params)
 
