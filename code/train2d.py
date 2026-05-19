@@ -23,7 +23,7 @@ import torchvision.transforms.functional as TF
 import wandb
 
 
-from model import FastFusionModel, MaxPower2DModel
+from model import FastFusionModel, MaxPower2DModel, CustomUNet, CustomUNetPlusPlus, CustomUNet3Plus
 from losses import RadarFusionLoss
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 
@@ -54,7 +54,7 @@ class RaDelftWrapper(Dataset):
         # 1. seperate Elevation /Power
         #  input_cube  (2, 128, 512, 256) -> (Channel, Doppler, Range, Azimuth)
         # index 0 refers to Power
-        power_cube = input_cube[0] #  (128, 512, 256)
+        power_cube = input_cube #  (128, 512, 256)
         # elevation_cube = input_cube[1] # (128, 512, 256) 
         
         # 2. adjust the order
@@ -62,42 +62,42 @@ class RaDelftWrapper(Dataset):
         power_cube = np.transpose(power_cube, (1, 0, 2)) #  (512, 128, 256)
         # elevation_cube = np.transpose(elevation_cube, (1, 0, 2))
         
-        range_cell_size = 0.1004
-        max_range = 51.4242
-        range_axis = np.arange(range_cell_size, max_range + range_cell_size, range_cell_size)
-        range_axis = range_axis[10:-3]
-        # Azimuth Axis 
-        angle_fft_size = 256 
-        wx_vec = np.linspace(-np.pi, np.pi, angle_fft_size) 
-        wx_vec = wx_vec[8:248] 
-        azimuth_axis = np.arcsin(wx_vec / (2 * np.pi * 0.4972))
-        # Elevation Axis 
-        ele_fft_size = 128 
-        wz_vec = np.linspace(-np.pi, np.pi, ele_fft_size) 
-        wz_vec = wz_vec[47:81] 
-        elevation_axis = np.arcsin(wz_vec / (2 * np.pi * 0.4972))
+        # range_cell_size = 0.1004
+        # max_range = 51.4242
+        # range_axis = np.arange(range_cell_size, max_range + range_cell_size, range_cell_size)
+        # range_axis = range_axis[10:-3]
+        # # Azimuth Axis 
+        # angle_fft_size = 256 
+        # wx_vec = np.linspace(-np.pi, np.pi, angle_fft_size) 
+        # wx_vec = wx_vec[8:248] 
+        # azimuth_axis = np.arcsin(wx_vec / (2 * np.pi * 0.4972))
+        # # Elevation Axis 
+        # ele_fft_size = 128 
+        # wz_vec = np.linspace(-np.pi, np.pi, ele_fft_size) 
+        # wz_vec = wz_vec[47:81] 
+        # elevation_axis = np.arcsin(wz_vec / (2 * np.pi * 0.4972))
 
-        E = elevation_axis          # (34,)
-        R = range_axis             # (500,)
-        A = azimuth_axis           # (240,)
+        # E = elevation_axis          # (34,)
+        # R = range_axis             # (500,)
+        # A = azimuth_axis           # (240,)
 
-        E_grid, R_grid, A_grid = np.meshgrid(E, R, A, indexing='ij')
+        # E_grid, R_grid, A_grid = np.meshgrid(E, R, A, indexing='ij')
 
-        # 坐标变换
-        Z = R_grid * np.sin(E_grid)
-        X = R_grid * np.cos(E_grid) * np.cos(A_grid)
-        Y = R_grid * np.cos(E_grid) * np.sin(A_grid)
-        z_min = -1.0   # 地面以下一点
-        z_max = 2.5    # SUV / truck 上限
-        mask = (Z >= z_min) & (Z <= z_max)
-        gt_filtered = gt_cube * mask
+        # # 坐标变换
+        # Z = R_grid * np.sin(E_grid)
+        # X = R_grid * np.cos(E_grid) * np.cos(A_grid)
+        # Y = R_grid * np.cos(E_grid) * np.sin(A_grid)
+        # z_min = -1.0   # 地面以下一点
+        # z_max = 2.5    # SUV / truck 上限
+        # mask = (Z >= z_min) & (Z <= z_max)
+        # gt_filtered = gt_cube * mask
 
 
 
-        occupancy_target = np.max(gt_filtered, axis=0)  # (500, 240)
-        occupancy_target = (occupancy_target > 0).astype(np.float32)  # 二值化
+        # occupancy_target = np.max(gt_filtered, axis=0)  # (500, 240)
+        # occupancy_target = (occupancy_target > 0).astype(np.float32)  # 二值化
         # 
-        occupancy_target = np.squeeze(occupancy_target) #(500, 240)
+        occupancy_target = np.squeeze(gt_cube) #(500, 240)
 
         
         return {
@@ -125,6 +125,8 @@ def main():
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--seed', type=int, default=42, help='随机种子，确保结果可复现')
+    parser.add_argument('--model', type=str, default='CustomUNetPlusPlus', help='选择模型类型')
 
     args = parser.parse_args()
     
@@ -152,6 +154,7 @@ def main():
         params["dataset_path"] = '/scratch/shujianjia/dataset/'
         params["train_val_scenes"] = [1,3,4,5,7]
         params["test_scenes"] = [2,6]
+        params["bev"] = True
         train_dataset = RaDelftWrapper(mode='train', params=params)
         val_dataset = RaDelftWrapper(mode='val', params=params)
     # else:
@@ -166,15 +169,23 @@ def main():
     #     angle_bins=args.angle_bins,
     #     doppler_channels=128
     # ).to(args.device)
+    MODEL_REGISTRY = {
+    'CustomUNet': CustomUNet,
+    'CustomUNetPlusPlus': CustomUNetPlusPlus,
+    'CustomUNet3Plus': CustomUNet3Plus,
+    }
+    model_class =MODEL_REGISTRY[args.model]
 
     model = MaxPower2DModel(
+        model=model_class,
         in_channels=2
     ).to(args.device)
+    print(f"模型使用：{args.model}")
     
     # model.unet.freeze_backbone()
 
     # 3.  Loss
-    criterion = RadarFusionLoss(weight_focal=1.0, weight_dice=0.0)
+    criterion = RadarFusionLoss(weight_focal=1.0, weight_dice=0.1,weight_cfar=0.0) # 先不考虑 quantile loss
     
     # 4. optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4) # AdamW 比 Adam 更利于泛化
@@ -266,8 +277,6 @@ def main():
         total_val_loss = 0.0
         pd_list = []
         pfa_list = []
-        qpd_list = []
-        qpfa_list = []
         count=0
         with torch.no_grad():
             for batch_data in val_loader:

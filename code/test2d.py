@@ -18,11 +18,12 @@ radelft_dir = current_dir / "radelft"
 sys.path.insert(0, str(radelft_dir)) 
 sys.path.insert(0, str(current_dir))
 
-from model import MaxPower2DModel
+from model import MaxPower2DModel,CustomUNet, CustomUNetPlusPlus, CustomUNet3Plus
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 from radelft.utils.compute_metrics import compute_pd_pfa
 from radelft.data_preparation import data_preparation
 from scipy.ndimage import distance_transform_edt
+from train2d import RaDelftWrapper
 # ==========================================
 # 辅助函数：计算 Chamfer Distance (2D)
 # ==========================================
@@ -74,27 +75,27 @@ def compute_chamfer_distance_2d(gt_pc, pred_pc):
 #     return (dist_gt_to_pred + dist_pred_to_gt) / 2.0
 
 
-class RaDelftTestWrapper(torch.utils.data.Dataset):
-    """
-    复用你的 Wrapper，专用于测试集
-    """
-    def __init__(self, mode='val', params=None):
-        self.real_dataset = RADCUBE_DATASET(mode=mode, params=params)
+# class RaDelftTestWrapper(torch.utils.data.Dataset):
+#     """
+#     复用你的 Wrapper，专用于测试集
+#     """
+#     def __init__(self, mode='val', params=None):
+#         self.real_dataset = RADCUBE_DATASET(mode=mode, params=params)
 
-    def __len__(self):
-        return len(self.real_dataset)
+#     def __len__(self):
+#         return len(self.real_dataset)
 
-    def __getitem__(self, idx):
-        input_cube, gt_cube, item_params = self.real_dataset[idx]
-        power_cube = input_cube[0]
-        power_cube = np.transpose(power_cube, (1, 0, 2))
-        occupancy_target = np.squeeze(gt_cube) 
+#     def __getitem__(self, idx):
+#         input_cube, gt_cube, item_params = self.real_dataset[idx]
+#         power_cube = input_cube[0]
+#         power_cube = np.transpose(power_cube, (1, 0, 2))
+#         occupancy_target = np.squeeze(gt_cube) 
         
-        return {
-            'radar_cube': torch.from_numpy(power_cube).float(),
-            'occupancy_target': torch.from_numpy(occupancy_target).float(),
-            'metadata': item_params  # 包含 scene / frame 信息
-        }
+#         return {
+#             'radar_cube': torch.from_numpy(power_cube).float(),
+#             'occupancy_target': torch.from_numpy(occupancy_target).float(),
+#             'metadata': item_params  # 包含 scene / frame 信息
+#         }
 
 # ==========================================
 # 推理与可视化主函数
@@ -106,6 +107,8 @@ def main():
                         default='./checkpoints/run_20260317_013246/best_epoch_11_loss_0.0118.pth')
     parser.add_argument('--output_dir', type=str, default='./results')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--model', type=str, default='CustomUNetPlusPlus', help='选择模型类型')
+
     args = parser.parse_args()
     
     # 1. 创建输出目录
@@ -143,12 +146,19 @@ def main():
     params["dataset_path"] = '/scratch/shujianjia/dataset/'
     params["train_val_scenes"] = [1, 3, 4, 5, 7]
     params["test_scenes"] = [2, 6]  # 仅测试集
+    params["bev"]=True
     
-    test_dataset = RaDelftTestWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8)
+    test_dataset = RaDelftWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
 
+    MODEL_REGISTRY = {
+    'CustomUNet': CustomUNet,
+    'CustomUNetPlusPlus': CustomUNetPlusPlus,
+    'CustomUNet3Plus': CustomUNet3Plus,
+    }
+    model_class =MODEL_REGISTRY[args.model]
     # 3. 初始化模型并加载权重
-    model = MaxPower2DModel(in_channels=2).to(args.device)
+    model = MaxPower2DModel(model=model_class,in_channels=2).to(args.device)
     
     # 解析字典并加载权重
     checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
@@ -218,8 +228,8 @@ def main():
             occupancy_target = batch_data['occupancy_target']
             
             # 2D GT
-            occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
-            occupancy_target_2d = occupancy_target_2d.to(args.device)
+            # occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
+            occupancy_target_2d = occupancy_target.to(args.device)
             
             # 模型前向传播
             outputs = model(radar_cube)
@@ -233,20 +243,20 @@ def main():
             radar_energy_4d = radar_energy.unsqueeze(1)      # (B, 1, R, A)
             
             # 计算 pred 和 bgenergy
-            #pred = 1.0 - occupancy_logits
-            #bgenergy = pred * radar_energy_4d
+            pred = 1.0 - occupancy_logits
+            bgenergy = pred * radar_energy_4d
             
             # 计算局部背景噪声
             kernel_size = 5
             pad = kernel_size // 2
-            #bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
-            # unfolded = F.unfold(bgenergy, kernel_size=os_win_size, padding=os_pad)
+            bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
+            unfolded = F.unfold(bgenergy, kernel_size=os_win_size, padding=os_pad)
             # valid_cells = unfolded[:, train_mask, :]
             # local_bg_noise_sum, _ = torch.kthvalue(valid_cells, k_index, dim=1)
             # local_bg_noise_sum = local_bg_noise_sum.view(1, 1, 500, 240)
             # local_bg_noise_sum = F.conv2d(bgenergy, cfar_kernel, stride=1, padding=pad_cfar)
             # local_bg_weight_sum = local_bg_noise_sum / (num_train_cells) 
-            #local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
+            local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
             # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
 
             # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
@@ -258,7 +268,7 @@ def main():
             gt_np = occupancy_target_2d.squeeze().cpu().numpy()
             radar_energy_np = radar_energy_4d.squeeze().cpu().numpy()
             #pred_np = pred.squeeze().cpu().numpy()
-            #bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
+            bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
             # final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
 
             # 命名
@@ -275,9 +285,9 @@ def main():
             # ==============================
             for current_alpha in test_alphas:
                 # break
-                # final_pred_2d = radar_energy_np > (current_alpha * bg_noise_np)
-                final_pred_2d = occupancy_logits>0.5
-                final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
+                final_pred_2d = radar_energy_np > (current_alpha * bg_noise_np)
+                # final_pred_2d = occupancy_logits>0.5
+                final_pred_np = final_pred_2d.squeeze().astype(np.float32)
                 # final_pred_np = final_pred_2d.squeeze().astype(np.float32)
                 pd_val, pfa_val = compute_pd_pfa(gt_np, final_pred_np)
 
@@ -300,8 +310,8 @@ def main():
                     'Pfa': pfa_val,
                     'Chamfer_Dist': cd_val
                 })
-                if current_alpha == 1.0:
-                    continue
+                # if current_alpha == 1.0:
+                #     continue
 
 
 
@@ -355,7 +365,7 @@ def main():
     avg_pfa = df_metrics['Pfa'].mean()
     
     # 保存 CSV
-    csv_path = os.path.join(args.output_dir, "408ablation1.csv")
+    csv_path = os.path.join(args.output_dir, "502跑的Unet.csv")
     df_metrics.to_csv(csv_path, index=False)
     
     # 保存 TXT Summary

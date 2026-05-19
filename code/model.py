@@ -118,7 +118,7 @@ class MaxPower2DModel(nn.Module):
     input:(B, Range, Doppler, Azimuth) - (B, 512, 128, 256)
     Extract Max Doppler Power and corresponding Index as 2D feature input
     """
-    def __init__(self, in_channels: int = 2, encoder_name: str = "resnet18"):
+    def __init__(self, model, in_channels: int = 2, encoder_name: str = "resnet18"):
         super().__init__()
         
        
@@ -129,7 +129,7 @@ class MaxPower2DModel(nn.Module):
         #     in_channels=in_channels, 
         #     classes=1 
         # )
-        self.unet = CustomUNetPlusPlus(
+        self.unet = model(
             in_channels=in_channels, 
             classes=1 
         )
@@ -305,22 +305,149 @@ class CustomUNetPlusPlus(nn.Module):
         
         return out
 
-    def freeze_backbone(self):
-        """
-        freeze
-        """
-        print("正在冻结 ResNet18 的layer1 to layer4")
+class CustomUNet(nn.Module):
+    """
+    Standard U-Net architecture.
+    Direct skip connections from encoder to decoder without intermediate nodes.
+    """
+    def __init__(self, in_channels=2, classes=1):
+        super().__init__()
+        self.encoder = CustomResNet18Encoder(in_channels=in_channels, pretrained=True)
         
-        for layer in [self.encoder.layer1, self.encoder.layer2, self.encoder.layer3, self.encoder.layer4]:
-            for param in layer.parameters():
-                param.requires_grad = False
-                
+        # Decoder output channels matching the existing ResNet18 levels
+        ch = [32, 64, 128, 256]
+        
+        # Simply upsample the lower feature and concat with ONE corresponding encoder skip
+        self.node_3 = DecoderNode(up_in_channels=512, skip_channels_list=[256], out_channels=ch[3])
+        self.node_2 = DecoderNode(up_in_channels=ch[3], skip_channels_list=[128], out_channels=ch[2])
+        self.node_1 = DecoderNode(up_in_channels=ch[2], skip_channels_list=[64], out_channels=ch[1])
+        self.node_0 = DecoderNode(up_in_channels=ch[1], skip_channels_list=[64], out_channels=ch[0])
+
+        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.final_conv = nn.Conv2d(ch[0], classes, kernel_size=1)
+
+    def forward(self, x):
+        features = self.encoder(x)
+        x0_0, x1_0, x2_0, x3_0, x4_0 = features
+        
+        # Straightforward data flow
+        d3 = self.node_3(up_x=x4_0, skip_xs=[x3_0])
+        d2 = self.node_2(up_x=d3,   skip_xs=[x2_0])
+        d1 = self.node_1(up_x=d2,   skip_xs=[x1_0])
+        d0 = self.node_0(up_x=d1,   skip_xs=[x0_0])
+        
+        out = self.final_up(d0)
+        out = self.final_conv(out)
+        
+        return out
+
+
+
+class Unet3ScaleConv(nn.Module):
+    """
+    Helper module for UNet 3+ to unify spatial resolutions.
+    scale_factor > 1.0 : Upsample
+    scale_factor < 1.0 : Downsample (using MaxPool for preserving strongest radar signals)
+    scale_factor == 1.0: Identity routing
+    """
+    def __init__(self, in_ch, out_ch, scale_factor):
+        super().__init__()
+        if scale_factor < 1.0:
+            self.scale = nn.MaxPool2d(int(1 / scale_factor), int(1 / scale_factor))
+        elif scale_factor > 1.0:
+            self.scale = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
+        else:
+            self.scale = nn.Identity()
+            
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.conv(self.scale(x))
+
         
 
-    def unfreeze_backbone(self):
-        """
-        unfreeze
-        """
-        # print("正在解冻 ResNet18 全网络...")
-        for param in self.encoder.parameters():
-            param.requires_grad = True
+class CustomUNet3Plus(nn.Module):
+    """
+    UNet 3+ Architecture.
+    Full-scale Skip Connections: Every decoder layer aggregates features from ALL encoder 
+    scales and ALL previously computed decoder scales.
+    """
+    def __init__(self, in_channels=2, classes=1):
+        super().__init__()
+        self.encoder = CustomResNet18Encoder(in_channels=in_channels, pretrained=True)
+        
+        # UNet 3+ uses unified channels for concatenation to avoid feature domination
+        cat_ch = 64
+        out_ch = cat_ch * 5 # 5 inputs per scale -> 320
+        
+        # Decoder 3 (Target Resolution: H/16)
+        self.d3_e0 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.125) # Down 8x
+        self.d3_e1 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.25)  # Down 4x
+        self.d3_e2 = Unet3ScaleConv(128, cat_ch, scale_factor=0.5)   # Down 2x
+        self.d3_e3 = Unet3ScaleConv(256, cat_ch, scale_factor=1.0)   # Same
+        self.d3_e4 = Unet3ScaleConv(512, cat_ch, scale_factor=2.0)   # Up 2x
+        self.d3_fuse = ConvBlock(out_ch, out_ch)
+
+        # Decoder 2 (Target Resolution: H/8)
+        self.d2_e0 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.25)
+        self.d2_e1 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.5)
+        self.d2_e2 = Unet3ScaleConv(128, cat_ch, scale_factor=1.0)
+        self.d2_d3 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=2.0)
+        self.d2_e4 = Unet3ScaleConv(512, cat_ch, scale_factor=4.0)
+        self.d2_fuse = ConvBlock(out_ch, out_ch)
+
+        # Decoder 1 (Target Resolution: H/4)
+        self.d1_e0 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.5)
+        self.d1_e1 = Unet3ScaleConv(64,  cat_ch, scale_factor=1.0)
+        self.d1_d2 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=2.0)
+        self.d1_d3 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=4.0)
+        self.d1_e4 = Unet3ScaleConv(512, cat_ch, scale_factor=8.0)
+        self.d1_fuse = ConvBlock(out_ch, out_ch)
+
+        # Decoder 0 (Target Resolution: H/2)
+        self.d0_e0 = Unet3ScaleConv(64,  cat_ch, scale_factor=1.0)
+        self.d0_d1 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=2.0)
+        self.d0_d2 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=4.0)
+        self.d0_d3 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=8.0)
+        self.d0_e4 = Unet3ScaleConv(512, cat_ch, scale_factor=16.0)
+        self.d0_fuse = ConvBlock(out_ch, out_ch)
+
+        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.final_conv = nn.Conv2d(out_ch, classes, kernel_size=1)
+
+    def forward(self, x):
+        # e0:H/2, e1:H/4, e2:H/8, e3:H/16, e4:H/32
+        e0, e1, e2, e3, e4 = self.encoder(x)
+        
+        # D3 Level Synthesis
+        d3 = self.d3_fuse(torch.cat([
+            self.d3_e0(e0), self.d3_e1(e1), self.d3_e2(e2), 
+            self.d3_e3(e3), self.d3_e4(e4)
+        ], dim=1))
+
+        # D2 Level Synthesis
+        d2 = self.d2_fuse(torch.cat([
+            self.d2_e0(e0), self.d2_e1(e1), self.d2_e2(e2), 
+            self.d2_d3(d3), self.d2_e4(e4)
+        ], dim=1))
+
+        # D1 Level Synthesis
+        d1 = self.d1_fuse(torch.cat([
+            self.d1_e0(e0), self.d1_e1(e1), self.d1_d2(d2), 
+            self.d1_d3(d3), self.d1_e4(e4)
+        ], dim=1))
+
+        # D0 Level Synthesis
+        d0 = self.d0_fuse(torch.cat([
+            self.d0_e0(e0), self.d0_d1(d1), self.d0_d2(d2), 
+            self.d0_d3(d3), self.d0_e4(e4)
+        ], dim=1))
+
+        out = self.final_up(d0)
+        out = self.final_conv(out)
+        
+        return out
