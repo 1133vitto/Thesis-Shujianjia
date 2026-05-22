@@ -185,7 +185,7 @@ def main():
     # model.unet.freeze_backbone()
 
     # 3.  Loss
-    criterion = RadarFusionLoss(weight_focal=1.0, weight_dice=0.1,weight_cfar=0.0) # 先不考虑 quantile loss
+    criterion = RadarFusionLoss(weight_focal=1.0, weight_dice=0,weight_cfar=0) # 先不考虑 quantile loss
     
     # 4. optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4) # AdamW 比 Adam 更利于泛化
@@ -224,6 +224,7 @@ def main():
             # forward
             outputs = model(radar_cube)
             occupancy_prob = outputs['occupancy_prob'][:, :-12, 8:-8]
+            occupancy_logits = outputs['occupancy_logits'][:, :-12, 8:-8]
             radar_energy = outputs['ra_energy'][:, :, :-12, 8:-8]#( B, 1, R, A  )
             # quantile_preds = outputs['quantiles'][..., :-12, 8:-8]
             # radar_energy = outputs['ra_energy'][..., :-12, 8:-8]
@@ -243,7 +244,7 @@ def main():
 
 
             loss_dict = criterion(
-                occupancy_prob=occupancy_prob,
+                occupancy_logits=occupancy_logits,
                 # quantile_preds=quantile_preds,
                 occupancy_target=soft_targets,
                 radar_energy=radar_energy
@@ -261,9 +262,9 @@ def main():
             
             pbar.set_postfix({
                 'Tot': f"{loss.item():.3f}",
-                'Foc': f"{loss_dict['focal_loss'].item():.3f}",
-                'Dice': f"{loss_dict['dice_loss'].item():.3f}",
-                'CFAR': f"{loss_dict['cfar_loss'].item():.3f}",
+                'Foc': f"{loss_dict['focal_loss'].item():.3f}"
+                # 'Dice': f"{loss_dict['dice_loss'].item():.3f}",
+                # 'CFAR': f"{loss_dict['cfar_loss'].item():.3f}",
                 # 'Qnt': f"{loss_dict['quantile_loss'].item():.3f}"
             })
             # wandb.log({"epoch": epoch, "loss": loss})
@@ -314,7 +315,7 @@ def main():
 
 
                 loss_dict = criterion(
-                occupancy_prob=occupancy_prob,
+                occupancy_logits=occupancy_logits,
                 # quantile_preds=quantile_preds,
                 occupancy_target=soft_targets,
                 radar_energy=radar_energy

@@ -20,7 +20,7 @@ radelft_dir = current_dir / "radelft"
 sys.path.insert(0, str(radelft_dir)) 
 sys.path.insert(0, str(current_dir))
 
-from model import MaxPower2DModel, old2DModel
+from model import MaxPower2DModel, old2DModel, CustomUNet,CustomUNet3Plus, CustomUNetPlusPlus
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 from radelft.utils.compute_metrics import compute_pd_pfa
 from radelft.data_preparation import data_preparation
@@ -128,10 +128,12 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./results')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--test_version', type=str, default='1.0')
+    parser.add_argument('--max_frames', type=int, default=10,
+                        help='Maximum frames to visualize')
     args = parser.parse_args()
     
     # 1. 创建输出目录
-    vis_dir = os.path.join(args.output_dir, '422用420模型1跑中期图,18轮，size7,加NN')
+    vis_dir = os.path.join(args.output_dir, '细分点云unet502')
     os.makedirs(vis_dir, exist_ok=True)
     
     # Range Axis
@@ -174,13 +176,14 @@ def main():
     params["dataset_path"] = '/scratch/shujianjia/dataset/'
     params["train_val_scenes"] = [1, 3, 4, 5, 7]
     params["test_scenes"] = [2, 6]  # 仅测试集
+    params["bev"]=True
     
     test_dataset = RaDelftWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     # 3. 初始化模型并加载权重
     # model = old2DModel(in_channels=2).to(args.device)
-    model = MaxPower2DModel(in_channels=2).to(args.device)
+    model = MaxPower2DModel(model=CustomUNetPlusPlus,in_channels=2).to(args.device)
     
     # 解析字典并加载权重
     checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
@@ -190,7 +193,7 @@ def main():
         model.load_state_dict(checkpoint)
     
     model.eval()
-    dummy_input = torch.randn(1, 512, 128, 256)
+    dummy_input = torch.randn(1, 512, 128, 256).to(args.device) # 根据你的模型输入维度调整
     macs, params = profile(model, inputs=(dummy_input, ))
 
     # 4. 格式化输出，让它看起来更直观 (比如变成 M, G 等单位)
@@ -240,7 +243,7 @@ def main():
                 # 最终的二值化预测首先尝试了 TopK 的方式，替换了原来的逻辑。
 
 
-                alpha = 2
+                alpha = 2.5
                 final_pred_2d = radar_energy_4d > (alpha * local_bg_noise_sum)
                 bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
             
@@ -314,7 +317,13 @@ def main():
             nndirect_x=X[nndirect>0.5]
             nndirect_y=Y[nndirect>0.5]
 
-
+            # TP / FP / FN 掩码与坐标
+            tp_mask = (final_pred_np > 0.5) & (gt_np > 0.5)
+            fp_mask = (final_pred_np > 0.5) & (gt_np <= 0.5)
+            fn_mask = (final_pred_np <= 0.5) & (gt_np > 0.5)
+            tp_x, tp_y = X[tp_mask], Y[tp_mask]
+            fp_x, fp_y = X[fp_mask], Y[fp_mask]
+            fn_x, fn_y = X[fn_mask], Y[fn_mask]
 
             pd_val, pfa_val = compute_pd_pfa(gt_np, final_pred_np)
 
@@ -335,10 +344,11 @@ def main():
             # ==============================
             layout = [
             ["camera", "camera", "camera", "radar_energy"],
-            ["cfar_pred", "bg_noise", "final_pred_pc", "gt_pc"]
+            ["cfar_pred", "bg_noise", "final_pred_pc", "gt_pc"],
+            ["tp_points", "fp_points", "fn_points", "combined"],
             ]
 
-            fig, axd = plt.subplot_mosaic(layout, figsize=(20, 10), layout='constrained')
+            fig, axd = plt.subplot_mosaic(layout, figsize=(20, 15), layout='constrained')
             fig.suptitle(f"Test Set Evaluation - {title_info}", fontsize=18)
 
 
@@ -393,8 +403,24 @@ def main():
             axd["gt_pc"].scatter(gt_pc_x, gt_pc_y, s=3, c='green', marker='o')
             axd["gt_pc"].set_title("Ground Truth (Point Cloud)")
 
+            # 6. TP / FP / FN / Combined
+            axd["tp_points"].scatter(tp_x, tp_y, s=5, c='limegreen', marker='o', edgecolors='none')
+            axd["tp_points"].set_title(f"True Positives (n={len(tp_x)})")
+
+            axd["fp_points"].scatter(fp_x, fp_y, s=5, c='red', marker='o', edgecolors='none')
+            axd["fp_points"].set_title(f"False Positives (n={len(fp_x)})")
+
+            axd["fn_points"].scatter(fn_x, fn_y, s=5, c='dodgerblue', marker='o', edgecolors='none')
+            axd["fn_points"].set_title(f"False Negatives (n={len(fn_x)})")
+
+            axd["combined"].scatter(tp_x, tp_y, s=5, c='limegreen', marker='o', edgecolors='none', label='TP')
+            axd["combined"].scatter(fp_x, fp_y, s=5, c='red', marker='o', edgecolors='none', label='FP')
+            axd["combined"].scatter(fn_x, fn_y, s=5, c='dodgerblue', marker='o', edgecolors='none', label='FN')
+            axd["combined"].set_title(f"Combined (TP={len(tp_x)} / FP={len(fp_x)} / FN={len(fn_x)})")
+
             # 统一调整所有子图的坐标轴表现
-            for key in ["radar_energy", "cfar_pred", "bg_noise", "final_pred_pc", "gt_pc"]:
+            for key in ["radar_energy", "cfar_pred", "bg_noise", "final_pred_pc", "gt_pc",
+                        "tp_points", "fp_points", "fn_points", "combined"]:
                 axd[key].set_aspect('equal')
                 # 严格看齐你代码的横向视野 (-30m 到 30m)
                 axd[key].set_xlim(-30, 30)
@@ -413,38 +439,23 @@ def main():
             plt.close(fig) # 防止内存泄漏
 
             step += 1
-            if step > 10:
+            if step >= args.max_frames:
                 break
     # ==============================
     # 汇总并保存所有指标
     # ==============================
     # df_metrics = pd.DataFrame(metrics_records)
-    
-    # # 过滤掉 Chamfer Distance 计算中的 NaN (比如 GT 或 Pred 全黑的情况)
+
     # valid_cd = df_metrics['Chamfer_Dist'].dropna()
     # avg_cd = valid_cd.mean() if not valid_cd.empty else float('nan')
-    
+
     # avg_pd = df_metrics['Pd'].mean()
     # avg_pfa = df_metrics['Pfa'].mean()
-    
-    # 保存 CSV
-    # csv_path = os.path.join(args.output_dir, "metrics_report_1.csv")
+
+    # csv_path = os.path.join(vis_dir, "metrics_report.csv")
     # df_metrics.to_csv(csv_path, index=False)
-    
-    # 保存 TXT Summary
-    # txt_path = os.path.join(args.output_dir, "summary.txt")
-    # with open(txt_path, "w") as f:
-    #     f.write("=== 2D Radar Fusion Model Test Summary ===\n")
-    #     f.write(f"Model: {args.checkpoint_path}\n")
-    #     f.write(f"Total Frames Tested: {len(df_metrics)}\n\n")
-    #     f.write(f"Average Pd: {avg_pd:.4f}\n")
-    #     f.write(f"Average Pfa: {avg_pfa:.6f}\n")
-    #     f.write(f"Average Chamfer Distance: {avg_cd:.4f}\n")
-        
+
     print("\n✅ 推理和可视化全部完成！")
-    # print(f"👉 可视化图片文件夹: {vis_dir}")
-    # print(f"👉 详细指标数据: {csv_path}")
-    # print(f"👉 平均性能总结: {txt_path}")
     # print(f"   平均 Pd: {avg_pd:.4f} | 平均 Pfa: {avg_pfa:.6f} | 平均倒角距离: {avg_cd:.4f}")
 
 if __name__ == "__main__":

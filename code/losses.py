@@ -137,7 +137,25 @@ class StableFocalLoss(nn.Module):
         focal_loss = alpha_t * focal_weight * bce_loss
 
         return focal_loss.mean()
+    
+class StableQualityFocalLoss(nn.Module):
+    def __init__(self, gamma: float = 2.0):
+        super().__init__()
+        self.gamma = gamma
 
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # logits 是网络最后一层卷积直接输出的张量（无激活函数）
+        
+        # 1. 内部安全计算预测概率
+        pred = torch.sigmoid(logits)
+        
+        # 2. 使用 PyTorch 底层优化的带 logits 的 BCE，极度稳定
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        
+        # 3. 绝对误差权重
+        focal_weight = torch.abs(targets - pred) ** self.gamma
+        
+        return (focal_weight * bce_loss).mean()
 
 class MaskedQuantileLoss(nn.Module):
     """
@@ -188,8 +206,8 @@ class RadarFusionLoss(nn.Module):
     """
     def __init__(self,
                  weight_focal: float = 1.0,
-                 weight_dice: float = 0.1,
-                 weight_cfar: float = 0.1,
+                 weight_dice: float = 0,
+                 weight_cfar: float = 0,
                  # weight_quantile: float = 0.5,
                  # quantiles: list = [0.1, 0.5, 0.9]
                  ):
@@ -198,35 +216,34 @@ class RadarFusionLoss(nn.Module):
         self.weight_dice = weight_dice
         self.weight_cfar = weight_cfar
 
-        self.focal_loss = StableFocalLoss()
+        # self.focal_loss = StableFocalLoss()
+        self.focal_loss = StableQualityFocalLoss()
         self.dice_loss = DiceLoss()
         self.cfar_loss = SoftCFARLoss(alpha=2.0, beta=10.0)
         # self.quantile_loss = MaskedQuantileLoss(quantiles=quantiles)
 
     def forward(self,
-                occupancy_prob: torch.Tensor,    # model output probability (after sigmoid)
+                occupancy_logits: torch.Tensor,    # model output probability (after sigmoid)
                 # quantile_preds: torch.Tensor,
                 occupancy_target: torch.Tensor,   # LiDAR gt
                 radar_energy: torch.Tensor        # radar original
                 ) -> dict:
 
 
-        loss_focal = self.focal_loss(occupancy_prob, occupancy_target)
-        loss_dice = self.dice_loss(occupancy_prob, occupancy_target)
-        loss_cfar = self.cfar_loss(occupancy_prob, radar_energy, occupancy_target)
+        loss_focal = self.focal_loss(occupancy_logits, occupancy_target)
+        # loss_dice = self.dice_loss(occupancy_prob, occupancy_target)
+        # loss_cfar = self.cfar_loss(occupancy_prob, radar_energy, occupancy_target)
 
         # loss_quantile = self.quantile_loss(quantile_preds, radar_energy, occupancy_target)
 
 
-        total_loss = (self.weight_focal * loss_focal +
-                      self.weight_dice * loss_dice +
-                      self.weight_cfar * loss_cfar)
+        total_loss = (self.weight_focal * loss_focal)
 
 
         return {
             'total_loss': total_loss,
             'focal_loss': loss_focal,
-            'dice_loss': loss_dice,
-            'cfar_loss': loss_cfar,
+            # 'dice_loss': loss_dice,
+            # 'cfar_loss': loss_cfar,
             # 'quantile_loss': loss_quantile
         }
