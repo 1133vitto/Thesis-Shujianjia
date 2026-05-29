@@ -18,12 +18,11 @@ radelft_dir = current_dir / "radelft"
 sys.path.insert(0, str(radelft_dir)) 
 sys.path.insert(0, str(current_dir))
 
-from model import MaxPower2DModel,CustomUNet, CustomUNetPlusPlus, CustomUNet3Plus
+from model import HRNetV1_W18
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 from radelft.utils.compute_metrics import compute_pd_pfa
 from radelft.data_preparation import data_preparation
 from scipy.ndimage import distance_transform_edt
-from train2d import RaDelftWrapper
 # ==========================================
 # 辅助函数：计算 Chamfer Distance (2D)
 # ==========================================
@@ -107,8 +106,6 @@ def main():
                         default='./checkpoints/run_20260317_013246/best_epoch_11_loss_0.0118.pth')
     parser.add_argument('--output_dir', type=str, default='./results')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--model', type=str, default='CustomUNetPlusPlus', help='选择模型类型')
-
     args = parser.parse_args()
     
     # 1. 创建输出目录
@@ -148,17 +145,11 @@ def main():
     params["test_scenes"] = [2, 6]  # 仅测试集
     params["bev"]=True
     
-    test_dataset = RaDelftWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
+    test_dataset = RADCUBE_DATASET(mode='test', params=params)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
 
-    MODEL_REGISTRY = {
-    'CustomUNet': CustomUNet,
-    'CustomUNetPlusPlus': CustomUNetPlusPlus,
-    'CustomUNet3Plus': CustomUNet3Plus,
-    }
-    model_class =MODEL_REGISTRY[args.model]
     # 3. 初始化模型并加载权重
-    model = MaxPower2DModel(model=model_class,in_channels=2).to(args.device)
+    model = HRNetV1_W18().to(args.device)
     
     # 解析字典并加载权重
     checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
@@ -168,42 +159,6 @@ def main():
         model.load_state_dict(checkpoint)
     
     model.eval()
-
-    #CFAR 参数设置
-    cfar_win_size = 7      # 
-    cfar_guard_size = 3     # 
-
-    cfar_kernel = torch.ones((1, 1, cfar_win_size, cfar_win_size), dtype=torch.float32, device=args.device)
-
-    center = cfar_win_size // 2
-    g_half = cfar_guard_size // 2
-    cfar_kernel[:, :, center-g_half : center+g_half+1, center-g_half : center+g_half+1] = 0
-
-    num_train_cells = cfar_kernel.sum().item()
-    cfar_alpha = 2.0
-    pad_cfar = cfar_win_size // 2
-
-
-    #oscfar 参数设置
-    os_win_size = 5      # 
-    os_pad = os_win_size // 2
-
-    # 1. 创建一个全 True 的 2D 掩码
-    mask_2d = torch.ones((os_win_size, os_win_size), dtype=torch.bool, device=args.device)
-
-    # 2. 把中心的保护单元和 CUT 挖空 (设为 False)
-    center = os_win_size // 2
-    mask_2d[center : center+1, center : center+1] = False
-
-    # 3. 展平为 1D 掩码 (长度为 25)
-    train_mask = mask_2d.flatten()
-    num_train_cells = train_mask.sum().item()
-
-    # 4. 确定 OS-CFAR 的排序索引 k (通常取 0.75 * N)
-    # 意思是：从小到大排序，取第 75% 位置的值作为纯净背景代表
-    k_index = int(0.75 * num_train_cells)
-
-    print(f"✅ OS-CFAR 初始化: 窗口={os_win_size}x{os_win_size}, 训练单元数={num_train_cells}, k取值={k_index}")
 
     THETA, R = np.meshgrid(azimuth_axis, range_axis)
     X = R * np.sin(THETA)
@@ -220,134 +175,50 @@ def main():
 
     # 4. 
     metrics_records = []
-    test_alphas = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
     # 5. 
     with torch.no_grad():
         for batch_idx, batch_data in enumerate(tqdm(test_loader, desc="Testing & Plotting")):
-            radar_cube = batch_data['radar_cube'].to(args.device)
-            occupancy_target = batch_data['occupancy_target']
+            radar_cube, occupancy_target, item_params = batch_data
+            radar_cube = radar_cube.to(args.device)
             
-            # 2D GT
-            # occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
-            occupancy_target_2d = occupancy_target.to(args.device)
+            occupancy_target = occupancy_target.to(args.device)
             
             # 模型前向传播
-            outputs = model(radar_cube)
-            
-            # 维度截取 (根据你验证集的代码逻辑)
-            occupancy_logits = outputs['occupancy_prob'].unsqueeze(0) # (B,  R, A)
-            occupancy_logits = occupancy_logits[:, :-12, 8:-8]
-            radar_energy = outputs['ra_energy'][:, :-12, 8:-8] if outputs['ra_energy'].dim() == 3 else outputs['ra_energy'][:, 0, :-12, 8:-8]
-            
-            occupancy_logits = occupancy_logits.unsqueeze(1) # (B, 1, R, A)
-            radar_energy_4d = radar_energy.unsqueeze(1)      # (B, 1, R, A)
-            
-            # 计算 pred 和 bgenergy
-            pred = 1.0 - occupancy_logits
-            bgenergy = pred * radar_energy_4d
-            
-            # 计算局部背景噪声
-            kernel_size = 5
-            pad = kernel_size // 2
-            bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
-            unfolded = F.unfold(bgenergy, kernel_size=os_win_size, padding=os_pad)
-            # valid_cells = unfolded[:, train_mask, :]
-            # local_bg_noise_sum, _ = torch.kthvalue(valid_cells, k_index, dim=1)
-            # local_bg_noise_sum = local_bg_noise_sum.view(1, 1, 500, 240)
-            # local_bg_noise_sum = F.conv2d(bgenergy, cfar_kernel, stride=1, padding=pad_cfar)
-            # local_bg_weight_sum = local_bg_noise_sum / (num_train_cells) 
-            local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
-            # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
+            occupancy_prob = model(radar_cube)['occupancy_prob'][:, :-12, 8:-8]  # (B, 500, 240)
+            final_pred_2d = occupancy_prob > 0.5  # (B, 500, 240)
 
-            # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
-            
-            
-           
-            # 转换为 Numpy 
-           
-            gt_np = occupancy_target_2d.squeeze().cpu().numpy()
-            radar_energy_np = radar_energy_4d.squeeze().cpu().numpy()
-            #pred_np = pred.squeeze().cpu().numpy()
-            bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
-            # final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
+            gt_np = occupancy_target.squeeze().cpu().numpy()
+            final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
 
             # 命名
-            meta = batch_data['metadata']
+            meta = item_params[0]  # batch_size=1, first sample
             scene_id = meta.get('scene', [f'unk_{batch_idx}'])[0]
             if isinstance(scene_id, torch.Tensor): scene_id = scene_id.item()
             frame_id = meta.get('frame', [batch_idx])[0]
             if isinstance(frame_id, torch.Tensor): frame_id = frame_id.item()
 
             title_info = f"Scene: {scene_id} | Frame: {frame_id}"
-            
-            # ==============================
+
             # 指标计算
-            # ==============================
-            for current_alpha in test_alphas:
-                # break
-                final_pred_2d = radar_energy_np > (current_alpha * bg_noise_np)
-                # final_pred_2d = occupancy_logits>0.5
-                final_pred_np = final_pred_2d.squeeze().astype(np.float32)
-                # final_pred_np = final_pred_2d.squeeze().astype(np.float32)
-                pd_val, pfa_val = compute_pd_pfa(gt_np, final_pred_np)
+            pd_val, pfa_val = compute_pd_pfa(gt_np, final_pred_np)
 
-                pred_pc_x = X[final_pred_np>0.5]
-                pred_pc_y = Y[final_pred_np>0.5]
+            pred_pc_x = X[final_pred_np > 0.5]
+            pred_pc_y = Y[final_pred_np > 0.5]
 
-                gt_pc_x = X[gt_np>0.5]
-                gt_pc_y = Y[gt_np>0.5]
-                gt_pc_array = np.column_stack((gt_pc_x, gt_pc_y))
-                pred_pc_array = np.column_stack((pred_pc_x, pred_pc_y))
-                cd_val = compute_chamfer_distance_2d(gt_pc_array, pred_pc_array)
-                print(f"{title_info} -> alpha: {current_alpha}, Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}",flush=True)
-
-                tqdm.write(f"{title_info} -> alpha: {current_alpha}, Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}")
-                metrics_records.append({
-                    'Alpha': current_alpha,
-                    'Scene': scene_id,
-                    'Frame': frame_id,
-                    'Pd': pd_val,
-                    'Pfa': pfa_val,
-                    'Chamfer_Dist': cd_val
-                })
-                # if current_alpha == 1.0:
-                #     continue
-
-
-
-            ###cfar ososos
-            gt_pc_x = X[gt_np>0.5]
-            gt_pc_y = Y[gt_np>0.5]
+            gt_pc_x = X[gt_np > 0.5]
+            gt_pc_y = Y[gt_np > 0.5]
             gt_pc_array = np.column_stack((gt_pc_x, gt_pc_y))
-            radar_energy_pad= F.pad(radar_energy_4d, (os_pad, os_pad, os_pad, os_pad), mode='replicate')
-            unfolded = F.unfold(radar_energy_pad, kernel_size=os_win_size, padding=0)
-            valid_cells = unfolded[:, train_mask, :]
-            cfar_noise_mean, _ = torch.kthvalue(valid_cells, k_index, dim=1)
-            cfar_noise_mean = cfar_noise_mean.view(1, 1, 500, 240)
-            cfar_pred = (radar_energy_4d > (cfar_alpha * cfar_noise_mean))
+            pred_pc_array = np.column_stack((pred_pc_x, pred_pc_y))
+            cd_val = compute_chamfer_distance_2d(gt_pc_array, pred_pc_array)
+            print(f"{title_info} -> Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}", flush=True)
 
-            # radar_energy_pad= F.pad(radar_energy_4d, (pad_cfar, pad_cfar, pad_cfar, pad_cfar), mode='replicate')    
-            # cfar_noise_sum = F.conv2d(radar_energy_pad, cfar_kernel, padding=0)
-            # cfar_noise_mean = cfar_noise_sum / num_train_cells
-            ###cfar ososos
-            
-            
-            cfar_pred_np = cfar_pred.squeeze().cpu().numpy().astype(np.float32)
-            cfar_pd, cfar_pfa = compute_pd_pfa(gt_np, cfar_pred_np)
-
-            cfar_pred_pc_x = X[cfar_pred_np>0.5]
-            cfar_pred_pc_y = Y[cfar_pred_np>0.5]
-            cfar_pred_pc_array = np.column_stack((cfar_pred_pc_x, cfar_pred_pc_y))  
-
-            cfar_cd = compute_chamfer_distance_2d(gt_pc_array, cfar_pred_pc_array)
-            print(f"{title_info} -> CFAR (alpha={cfar_alpha}): Pd: {cfar_pd:.4f}, Pfa: {cfar_pfa:.6f}, Chamfer Dist: {cfar_cd:.4f}",flush=True)
+            tqdm.write(f"{title_info} -> Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}")
             metrics_records.append({
-                'Alpha': f'CFAR_{cfar_alpha}',
                 'Scene': scene_id,
                 'Frame': frame_id,
-                'Pd': cfar_pd,
-                'Pfa': cfar_pfa,
-                'Chamfer_Dist': cfar_cd 
+                'Pd': pd_val,
+                'Pfa': pfa_val,
+                'Chamfer_Dist': cd_val
             })
 
             

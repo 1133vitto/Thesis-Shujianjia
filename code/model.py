@@ -1,453 +1,272 @@
-"""
-models
-"""
-
 import torch
-import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset
-import numpy as np
-from einops import rearrange
-import segmentation_models_pytorch as smp
-from typing import Dict
 
 
-
-
-
-class FastFusionModel(nn.Module):
-    """
-    完整融合模型：编码器 + smp 提供的 U-Net
-    """
-    def __init__(self, angle_bins: int = 256, doppler_channels: int = 128):
-        super().__init__()
-        self.angle_bins = angle_bins
-        
-        
-        
-        self.unet = smp.Unet(
-            encoder_name="resnet18",      # 使用轻量级的 resnet18 作为主干提取特征
-            encoder_weights="imagenet",         
-            in_channels=doppler_channels, # 输入通道数等于doppler
-            
-            classes=1   
-        )
-
-    def forward(self, radar_cube: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # 1. (B, R, D, A) -> (B, D, R, A)
-        # encoded = self.encoder(radar_cube)
-        radar_cube = radar_cube.permute(0, 2, 1, 3)
-        # 2. 丢进 U-Net：输出 (B, 4, R, A)
-        unet_out = self.unet(radar_cube)
-        
-        # 3. 把 U-Net 的输出一分为二
-        # 第 0 个通道是 Occupancy（预测有没有障碍物）
-        occupancy_logits = unet_out[:, 0, :, :]  # (B,1, R, A)
-        # occupancy_logits = unet_out # (B, 1, R, A)
-        # 经过 Sigmoid 变成 0~1 之间的概率
-        occupancy = torch.sigmoid(occupancy_logits) 
-        
-       
-        ra_energy = torch.max(radar_cube, dim=1).values
-        
-    
-        
-        return {
-            'occupancy': occupancy,
-            # 'quantiles': quantiles,
-            # 'background_est': background_est,
-            # 'detection_score': detection_score,
-            'occupancy_logits':occupancy_logits,
-            'ra_energy': ra_energy
-        }
-
-
-class old2DModel(nn.Module):
-    """
-    
-    input:(B, Range, Doppler, Azimuth) - (B, 512, 128, 256)
-    Extract Max Doppler Power and corresponding Index as 2D feature input
-    """
-    def __init__(self, in_channels: int = 2, encoder_name: str = "resnet18"):
-        super().__init__()
-        
-       
-        #in_channels=2: Channel 0 是 Max Power, Channel 1 是 Normalized Doppler Index
-        self.unet = smp.UnetPlusPlus(
-            encoder_name=encoder_name,
-            encoder_weights="imagenet",
-            in_channels=in_channels, 
-            classes=1 
-        )
-        
-
-    def forward(self, radar_cube: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        radar_cube: (B, R, D, A)
-        """
-        
-        # max_power: (B, R, A), max_indices: (B, R, A)
-        max_power, max_indices = torch.max(radar_cube, dim=2)
-        max_power = max_power.unsqueeze(1) # (B, 1, R, A)
-        
-        # 
-        max_indices_norm = (max_indices.float() / 127.0).unsqueeze(1) # (B, 1, R, A)
-        
-        # 3. (B, 2, R, A)
-        x = torch.cat([max_power, max_indices_norm], dim=1)
-        
-        
-        logits = self.unet(x)  # raw logits
-
-        return {
-            'occupancy_prob': torch.sigmoid(logits).squeeze(),  # (B, R, A) - probability for detection
-            'occupancy_logits': logits.squeeze(),              # (B, R, A) - raw logits for loss
-            'ra_energy': max_power,                           # (B, 1, R, A)
-            'max_indices': max_indices                        # (B, R, A)
-        }
-
-
-
-
-
-
-class MaxPower2DModel(nn.Module):
-    """
-    
-    input:(B, Range, Doppler, Azimuth) - (B, 512, 128, 256)
-    Extract Max Doppler Power and corresponding Index as 2D feature input
-    """
-    def __init__(self, model, in_channels: int = 2, encoder_name: str = "resnet18"):
-        super().__init__()
-        
-       
-        # in_channels=2: Channel 0 是 Max Power, Channel 1 是 Normalized Doppler Index
-        # self.unet = smp.UnetPlusPlus(
-        #     encoder_name=encoder_name,
-        #     encoder_weights="imagenet",
-        #     in_channels=in_channels, 
-        #     classes=1 
-        # )
-        self.unet = model(
-            in_channels=in_channels, 
-            classes=1 
-        )
-
-    def forward(self, radar_cube: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        radar_cube: (B, R, D, A)
-        """
-        
-        # max_power: (B, R, A), max_indices: (B, R, A)
-        max_power, max_indices = torch.max(radar_cube, dim=2)
-        max_power = max_power.unsqueeze(1) # (B, 1, R, A)
-        
-        # 
-        max_indices_norm = (max_indices.float() / 127.0).unsqueeze(1) # (B, 1, R, A)
-        
-        # 3. (B, 2, R, A)
-        x = torch.cat([max_power, max_indices_norm], dim=1)
-        
-        
-        logits = self.unet(x)  # raw logits
-
-        return {
-            'occupancy_prob': torch.sigmoid(logits).squeeze(),  # (B, R, A) - probability for detection
-            'occupancy_logits': logits.squeeze(),              # (B, R, A) - raw logits for loss
-            'ra_energy': max_power,                           # (B, 1, R, A)
-            'max_indices': max_indices                        # (B, R, A)
-        }
-
-
-
-
-
-#customize model
 class ConvBlock(nn.Module):
-    """
-    (Conv + BN + ReLU) * 2
-    """
-    def __init__(self, in_channels, out_channels):
+    """Simple conv block: Conv2d + BN + ReLU. Used in stem and transitions."""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride,
+                              padding=kernel_size // 2, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(self.bn(self.conv(x)))
+
+
+class Bottleneck(nn.Module):
+    """ResNet bottleneck with expansion=4. Used only in Stage 1."""
+    expansion = 4
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        mid_channels = out_channels // self.expansion
+
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, 3, stride, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.use_shortcut = (stride != 1) or (in_channels != out_channels)
+        if self.use_shortcut:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        identity = self.shortcut(x) if self.use_shortcut else x
+
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+
+        return self.relu(out + identity)
+
+
+class BasicBlock(nn.Module):
+    """ResNet basic block (no bottleneck). Used in Stages 2-4."""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu1 = nn.ReLU(inplace=True)
-        
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        self.relu2 = nn.ReLU(inplace=True)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.use_shortcut = (stride != 1) or (in_channels != out_channels)
+        if self.use_shortcut:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
 
     def forward(self, x):
-        x = self.relu1(self.bn1(self.conv1(x)))
-        x = self.relu2(self.bn2(self.conv2(x)))
-        return x
+        identity = self.shortcut(x) if self.use_shortcut else x
 
-class DecoderNode(nn.Module):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        return self.relu(out + identity)
+
+
+class HighResolutionModule(nn.Module):
     """
-    U-Net++ decoder:  upsampling features from the lower layer and concatenating with skip connections from the encoder and previous decoder nodes
+    Multi-resolution cross-fusion.
+
+    Takes N feature maps at different resolutions, fuses them via
+    element-wise SUM, and outputs N feature maps at the same resolutions.
+
+    Parameters:
+        num_branches: number of parallel branches
+        channels_list: list of channel counts per branch [c0, c1, ..., c_{N-1}]
     """
-    def __init__(self, up_in_channels, skip_channels_list, out_channels):
+    def __init__(self, num_branches, channels_list):
         super().__init__()
-        # 
-        total_in_channels = up_in_channels + sum(skip_channels_list)
-        self.block = ConvBlock(total_in_channels, out_channels)
+        self.num_branches = num_branches
+        self.channels_list = channels_list
 
-    def forward(self, up_x, skip_xs):
-        up_x = F.interpolate(up_x, scale_factor=2, mode='bilinear', align_corners=False)
-        x = torch.cat(skip_xs + [up_x], dim=1)
-        return self.block(x)
+        # fuse_layers[i][j]: transform input branch j → output resolution i
+        self.fuse_layers = nn.ModuleList()
+        for i in range(num_branches):
+            row = nn.ModuleList()
+            for j in range(num_branches):
+                in_ch = channels_list[j]
+                out_ch = channels_list[i]
 
-class CustomResNet18Encoder(nn.Module):
-    """"""
-    def __init__(self, in_channels=2, pretrained=True):
-        super().__init__()
-        base_model = torchvision.models.resnet18(pretrained=pretrained)
-        
-        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        if pretrained:
-            with torch.no_grad():
-                self.conv1.weight.copy_(base_model.conv1.weight[:, :in_channels, :, :])
-                
-        self.bn1 = base_model.bn1
-        self.relu = base_model.relu
-        self.maxpool = base_model.maxpool
-        
-        self.layer1 = base_model.layer1
-        self.layer2 = base_model.layer2
-        self.layer3 = base_model.layer3
-        self.layer4 = base_model.layer4
+                if j == i:
+                    row.append(nn.Identity())
+
+                elif j > i:
+                    # j is coarser → upsample (j-i) times to reach resolution i
+                    layers = [
+                        nn.Conv2d(in_ch, out_ch, 1, bias=False),
+                        nn.BatchNorm2d(out_ch),
+                    ]
+                    for _ in range(j - i):
+                        layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+                    row.append(nn.Sequential(*layers))
+
+                else:  # j < i
+                    # j is finer → downsample (i-j) times
+                    layers = []
+                    for k in range(i - j):
+                        conv_in = in_ch if k == 0 else out_ch
+                        layers.extend([
+                            nn.Conv2d(conv_in, out_ch, 3, 2, 1, bias=False),
+                            nn.BatchNorm2d(out_ch),
+                            nn.ReLU(inplace=True),
+                        ])
+                    row.append(nn.Sequential(*layers))
+
+            self.fuse_layers.append(row)
 
     def forward(self, x):
-        features = []
-        # Stage 0: (B, 64, H/2, W/2)
-        x0 = self.relu(self.bn1(self.conv1(x)))
-        features.append(x0) 
-        
-        # Stage 1: (B, 64, H/4, W/4)
-        x1 = self.layer1(self.maxpool(x0))
-        features.append(x1)
-        
-        # Stage 2: (B, 128, H/8, W/8)
-        x2 = self.layer2(x1)
-        features.append(x2)
-        
-        # Stage 3: (B, 256, H/16, W/16)
-        x3 = self.layer3(x2)
-        features.append(x3)
-        
-        # Stage 4: (B, 512, H/32, W/32)
-        x4 = self.layer4(x3)
-        features.append(x4)
-        
-        return features # 返回 5 个层级的特征字典 [x0_0, x1_0, x2_0, x3_0, x4_0]
-
-class CustomUNetPlusPlus(nn.Module):
-    def __init__(self, in_channels=2, classes=1):
-        super().__init__()
-        self.encoder = CustomResNet18Encoder(in_channels=in_channels, pretrained=True)
-        
-        # 
-        ch = [32, 64, 128, 256] 
-        
-        # ---------------------------------------------------------
-        # Naming rules: node_{i}_{j}, i represents depth (0 is the shallowest), j represents horizontal progress
-        # ---------------------------------------------------------
-        
-        # L1: The first column of intermediate nodes
-        self.node_0_1 = DecoderNode(up_in_channels=64, skip_channels_list=[64], out_channels=ch[0])
-        self.node_1_1 = DecoderNode(up_in_channels=128, skip_channels_list=[64], out_channels=ch[1])
-        self.node_2_1 = DecoderNode(up_in_channels=256, skip_channels_list=[128], out_channels=ch[2])
-        self.node_3_1 = DecoderNode(up_in_channels=512, skip_channels_list=[256], out_channels=ch[3])
-
-        # L2: The second column of intermediate nodes
-        self.node_0_2 = DecoderNode(up_in_channels=ch[1], skip_channels_list=[64, ch[0]], out_channels=ch[0])
-        self.node_1_2 = DecoderNode(up_in_channels=ch[2], skip_channels_list=[64, ch[1]], out_channels=ch[1])
-        self.node_2_2 = DecoderNode(up_in_channels=ch[3], skip_channels_list=[128, ch[2]], out_channels=ch[2])
-
-        # L3: The third column of intermediate nodes
-        self.node_0_3 = DecoderNode(up_in_channels=ch[1], skip_channels_list=[64, ch[0], ch[0]], out_channels=ch[0])
-        self.node_1_3 = DecoderNode(up_in_channels=ch[2], skip_channels_list=[64, ch[1], ch[1]], out_channels=ch[1])
-
-        # L4: The fourth column of final nodes
-        self.node_0_4 = DecoderNode(up_in_channels=ch[1], skip_channels_list=[64, ch[0], ch[0], ch[0]], out_channels=ch[0])
-
-        # Final split header (restore H/2, W/2 to H, W)
-        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.final_conv = nn.Conv2d(ch[0], classes, kernel_size=1)
-
-    def forward(self, x):
-        features = self.encoder(x)
-        x0_0, x1_0, x2_0, x3_0, x4_0 = features
-        
-        
-        # Column 1
-        x0_1 = self.node_0_1(up_x=x1_0, skip_xs=[x0_0])
-        x1_1 = self.node_1_1(up_x=x2_0, skip_xs=[x1_0])
-        x2_1 = self.node_2_1(up_x=x3_0, skip_xs=[x2_0])
-        x3_1 = self.node_3_1(up_x=x4_0, skip_xs=[x3_0])
-
-        # Column 2
-        x0_2 = self.node_0_2(up_x=x1_1, skip_xs=[x0_0, x0_1])
-        x1_2 = self.node_1_2(up_x=x2_1, skip_xs=[x1_0, x1_1])
-        x2_2 = self.node_2_2(up_x=x3_1, skip_xs=[x2_0, x2_1])
-
-        # Column 3
-        x0_3 = self.node_0_3(up_x=x1_2, skip_xs=[x0_0, x0_1, x0_2])
-        x1_3 = self.node_1_3(up_x=x2_2, skip_xs=[x1_0, x1_1, x1_2])
-
-        # Column 4
-        x0_4 = self.node_0_4(up_x=x1_3, skip_xs=[x0_0, x0_1, x0_2, x0_3])
-
-        #
-        out = self.final_up(x0_4)
-        out = self.final_conv(out)
-        
-        return out
-
-class CustomUNet(nn.Module):
-    """
-    Standard U-Net architecture.
-    Direct skip connections from encoder to decoder without intermediate nodes.
-    """
-    def __init__(self, in_channels=2, classes=1):
-        super().__init__()
-        self.encoder = CustomResNet18Encoder(in_channels=in_channels, pretrained=True)
-        
-        # Decoder output channels matching the existing ResNet18 levels
-        ch = [32, 64, 128, 256]
-        
-        # Simply upsample the lower feature and concat with ONE corresponding encoder skip
-        self.node_3 = DecoderNode(up_in_channels=512, skip_channels_list=[256], out_channels=ch[3])
-        self.node_2 = DecoderNode(up_in_channels=ch[3], skip_channels_list=[128], out_channels=ch[2])
-        self.node_1 = DecoderNode(up_in_channels=ch[2], skip_channels_list=[64], out_channels=ch[1])
-        self.node_0 = DecoderNode(up_in_channels=ch[1], skip_channels_list=[64], out_channels=ch[0])
-
-        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.final_conv = nn.Conv2d(ch[0], classes, kernel_size=1)
-
-    def forward(self, x):
-        features = self.encoder(x)
-        x0_0, x1_0, x2_0, x3_0, x4_0 = features
-        
-        # Straightforward data flow
-        d3 = self.node_3(up_x=x4_0, skip_xs=[x3_0])
-        d2 = self.node_2(up_x=d3,   skip_xs=[x2_0])
-        d1 = self.node_1(up_x=d2,   skip_xs=[x1_0])
-        d0 = self.node_0(up_x=d1,   skip_xs=[x0_0])
-        
-        out = self.final_up(d0)
-        out = self.final_conv(out)
-        
+        """
+        Args:
+            x: list of N tensors at decreasing resolutions
+        Returns:
+            list of N tensors at the same resolutions, fused
+        """
+        out = []
+        for i in range(self.num_branches):
+            fused = self.fuse_layers[i][0](x[0])
+            for j in range(1, self.num_branches):
+                fused = fused + self.fuse_layers[i][j](x[j])
+            out.append(F.relu(fused))
         return out
 
 
+class HRNetV1_W18(nn.Module):
+    """
+    HRNetV1-W18, full-resolution version.
 
-class Unet3ScaleConv(nn.Module):
+    The highest-resolution branch stays at the input resolution (512x256)
+    throughout the entire network. No stem downsampling.
+    V1 head uses only the highest-resolution branch for the final output.
+
+    Input:  radar_cube (B, 512, 128, 256)  [Range, Doppler, Azimuth]
+    Output: dict with 'occupancy_prob': (B, 512, 256), values in [0, 1]
     """
-    Helper module for UNet 3+ to unify spatial resolutions.
-    scale_factor > 1.0 : Upsample
-    scale_factor < 1.0 : Downsample (using MaxPool for preserving strongest radar signals)
-    scale_factor == 1.0: Identity routing
-    """
-    def __init__(self, in_ch, out_ch, scale_factor):
+
+    def __init__(self):
         super().__init__()
-        if scale_factor < 1.0:
-            self.scale = nn.MaxPool2d(int(1 / scale_factor), int(1 / scale_factor))
-        elif scale_factor > 1.0:
-            self.scale = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
-        else:
-            self.scale = nn.Identity()
-            
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
+
+        # ---- Step 0: Doppler compression ----
+        # (B, 512, 128, 256) -> permute -> (B, 128, 512, 256) -> Conv1x1 -> (B, 3, 512, 256)
+        self.doppler_conv = nn.Conv2d(128, 3, kernel_size=1, stride=1)
+
+        # ---- Step 1: Stem (stride=1, keeps 512x256) ----
+        self.stem = nn.Sequential(
+            ConvBlock(3, 64, 3, 1),
+            ConvBlock(64, 64, 3, 1),
         )
 
-    def forward(self, x):
-        return self.conv(self.scale(x))
+        # ---- Step 2: Stage 1 (4x Bottleneck) ----
+        stage1_blocks = [Bottleneck(64, 256)]
+        for _ in range(3):
+            stage1_blocks.append(Bottleneck(256, 256))
+        self.stage1 = nn.Sequential(*stage1_blocks)
 
-        
+        # ---- Step 3: Transition 1 (256ch -> 2 branches) ----
+        self.transition1 = nn.ModuleList([
+            ConvBlock(256, 18, 3, 1),    # Branch 0 (hr): 512x256
+            ConvBlock(256, 36, 3, 2),    # Branch 1 (mr): 256x128
+        ])
 
-class CustomUNet3Plus(nn.Module):
-    """
-    UNet 3+ Architecture.
-    Full-scale Skip Connections: Every decoder layer aggregates features from ALL encoder 
-    scales and ALL previously computed decoder scales.
-    """
-    def __init__(self, in_channels=2, classes=1):
-        super().__init__()
-        self.encoder = CustomResNet18Encoder(in_channels=in_channels, pretrained=True)
-        
-        # UNet 3+ uses unified channels for concatenation to avoid feature domination
-        cat_ch = 64
-        out_ch = cat_ch * 5 # 5 inputs per scale -> 320
-        
-        # Decoder 3 (Target Resolution: H/16)
-        self.d3_e0 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.125) # Down 8x
-        self.d3_e1 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.25)  # Down 4x
-        self.d3_e2 = Unet3ScaleConv(128, cat_ch, scale_factor=0.5)   # Down 2x
-        self.d3_e3 = Unet3ScaleConv(256, cat_ch, scale_factor=1.0)   # Same
-        self.d3_e4 = Unet3ScaleConv(512, cat_ch, scale_factor=2.0)   # Up 2x
-        self.d3_fuse = ConvBlock(out_ch, out_ch)
+        # ---- Stage 2 branch blocks ----
+        self.stage2_hr_blocks = nn.Sequential(*[BasicBlock(18, 18) for _ in range(4)])
+        self.stage2_mr_blocks = nn.Sequential(*[BasicBlock(36, 36) for _ in range(4)])
 
-        # Decoder 2 (Target Resolution: H/8)
-        self.d2_e0 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.25)
-        self.d2_e1 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.5)
-        self.d2_e2 = Unet3ScaleConv(128, cat_ch, scale_factor=1.0)
-        self.d2_d3 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=2.0)
-        self.d2_e4 = Unet3ScaleConv(512, cat_ch, scale_factor=4.0)
-        self.d2_fuse = ConvBlock(out_ch, out_ch)
+        # ---- Step 4: Stage 2 (1x fusion module) ----
+        self.stage2_fusion = HighResolutionModule(2, [18, 36])
 
-        # Decoder 1 (Target Resolution: H/4)
-        self.d1_e0 = Unet3ScaleConv(64,  cat_ch, scale_factor=0.5)
-        self.d1_e1 = Unet3ScaleConv(64,  cat_ch, scale_factor=1.0)
-        self.d1_d2 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=2.0)
-        self.d1_d3 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=4.0)
-        self.d1_e4 = Unet3ScaleConv(512, cat_ch, scale_factor=8.0)
-        self.d1_fuse = ConvBlock(out_ch, out_ch)
+        # ---- Step 5: Transition 2 (add 3rd branch from branch 1) ----
+        self.transition2 = ConvBlock(36, 72, 3, 2)   # lr: 128x64
 
-        # Decoder 0 (Target Resolution: H/2)
-        self.d0_e0 = Unet3ScaleConv(64,  cat_ch, scale_factor=1.0)
-        self.d0_d1 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=2.0)
-        self.d0_d2 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=4.0)
-        self.d0_d3 = Unet3ScaleConv(out_ch, cat_ch, scale_factor=8.0)
-        self.d0_e4 = Unet3ScaleConv(512, cat_ch, scale_factor=16.0)
-        self.d0_fuse = ConvBlock(out_ch, out_ch)
+        # ---- Stage 3 branch blocks ----
+        self.stage3_hr_blocks = nn.Sequential(*[BasicBlock(18, 18) for _ in range(4)])
+        self.stage3_mr_blocks = nn.Sequential(*[BasicBlock(36, 36) for _ in range(4)])
+        self.stage3_lr_blocks = nn.Sequential(*[BasicBlock(72, 72) for _ in range(4)])
 
-        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.final_conv = nn.Conv2d(out_ch, classes, kernel_size=1)
+        # ---- Step 6: Stage 3 (4x fusion modules) ----
+        self.stage3_fusions = nn.ModuleList([
+            HighResolutionModule(3, [18, 36, 72]) for _ in range(4)
+        ])
+
+        # ---- Step 7: Transition 3 (add 4th branch from branch 2) ----
+        self.transition3 = ConvBlock(72, 144, 3, 2)  # vlr: 64x32
+
+        # ---- Stage 4 branch blocks ----
+        self.stage4_hr_blocks = nn.Sequential(*[BasicBlock(18, 18) for _ in range(4)])
+        self.stage4_mr_blocks = nn.Sequential(*[BasicBlock(36, 36) for _ in range(4)])
+        self.stage4_lr_blocks = nn.Sequential(*[BasicBlock(72, 72) for _ in range(4)])
+        self.stage4_vlr_blocks = nn.Sequential(*[BasicBlock(144, 144) for _ in range(4)])
+
+        # ---- Step 8: Stage 4 (3x fusion modules) ----
+        self.stage4_fusions = nn.ModuleList([
+            HighResolutionModule(4, [18, 36, 72, 144]) for _ in range(3)
+        ])
+
+        # ---- Step 9: V1 Final Head ----
+        # Only the highest-resolution branch (18ch @ 512x256) -> 1ch
+        self.final_conv = nn.Conv2d(18, 1, kernel_size=1, stride=1)
 
     def forward(self, x):
-        # e0:H/2, e1:H/4, e2:H/8, e3:H/16, e4:H/32
-        e0, e1, e2, e3, e4 = self.encoder(x)
-        
-        # D3 Level Synthesis
-        d3 = self.d3_fuse(torch.cat([
-            self.d3_e0(e0), self.d3_e1(e1), self.d3_e2(e2), 
-            self.d3_e3(e3), self.d3_e4(e4)
-        ], dim=1))
+        """
+        Args:
+            x: radar_cube (B, 512, 128, 256)
+        Returns:
+            {'occupancy_prob': (B, 512, 256)}
+        """
+        # Step 0: Doppler compression
+        # x is already (B, D, R, A) from RADCUBE_DATASET (bev=True)
+        x = self.doppler_conv(x)                    # Conv2d(128,3,1): (B,128,512,256) -> (B,3,512,256)
 
-        # D2 Level Synthesis
-        d2 = self.d2_fuse(torch.cat([
-            self.d2_e0(e0), self.d2_e1(e1), self.d2_e2(e2), 
-            self.d2_d3(d3), self.d2_e4(e4)
-        ], dim=1))
+        # Step 1: Stem
+        x = self.stem(x)                            # (B, 64, 512, 256)
 
-        # D1 Level Synthesis
-        d1 = self.d1_fuse(torch.cat([
-            self.d1_e0(e0), self.d1_e1(e1), self.d1_d2(d2), 
-            self.d1_d3(d3), self.d1_e4(e4)
-        ], dim=1))
+        # Step 2: Stage 1
+        x = self.stage1(x)                          # (B, 256, 512, 256)
 
-        # D0 Level Synthesis
-        d0 = self.d0_fuse(torch.cat([
-            self.d0_e0(e0), self.d0_d1(d1), self.d0_d2(d2), 
-            self.d0_d3(d3), self.d0_e4(e4)
-        ], dim=1))
+        # Step 3: Transition 1 -> 2 branches
+        hr = self.transition1[0](x)                 # (B, 18, 512, 256)
+        mr = self.transition1[1](x)                 # (B, 36, 256, 128)
 
-        out = self.final_up(d0)
-        out = self.final_conv(out)
-        
-        return out
+        # Step 4: Stage 2
+        hr, mr = self.stage2_fusion([hr, mr])
+        hr = self.stage2_hr_blocks(hr)
+        mr = self.stage2_mr_blocks(mr)
+
+        # Step 5: Transition 2 -> 3 branches
+        lr = self.transition2(mr)                   # (B, 72, 128, 64)
+
+        # Step 6: Stage 3 (4 fusion layers)
+        for fusion in self.stage3_fusions:
+            hr, mr, lr = fusion([hr, mr, lr])
+            hr = self.stage3_hr_blocks(hr)
+            mr = self.stage3_mr_blocks(mr)
+            lr = self.stage3_lr_blocks(lr)
+
+        # Step 7: Transition 3 -> 4 branches
+        vlr = self.transition3(lr)                  # (B, 144, 64, 32)
+
+        # Step 8: Stage 4 (3 fusion layers)
+        for fusion in self.stage4_fusions:
+            hr, mr, lr, vlr = fusion([hr, mr, lr, vlr])
+            hr = self.stage4_hr_blocks(hr)
+            mr = self.stage4_mr_blocks(mr)
+            lr = self.stage4_lr_blocks(lr)
+            vlr = self.stage4_vlr_blocks(vlr)
+
+        # Step 9: V1 Head — only highest-resolution branch
+        out = self.final_conv(hr)                   # (B, 1, 512, 256)
+        out = out.squeeze(1)                        # (B, 512, 256)
+        out = torch.sigmoid(out)                    # (B, 512, 256)
+
+        return {'occupancy_prob': out}

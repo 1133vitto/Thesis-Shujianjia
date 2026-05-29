@@ -20,11 +20,10 @@ radelft_dir = current_dir / "radelft"
 sys.path.insert(0, str(radelft_dir)) 
 sys.path.insert(0, str(current_dir))
 
-from model import MaxPower2DModel, old2DModel, CustomUNet,CustomUNet3Plus, CustomUNetPlusPlus
+from model import HRNetV1_W18
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 from radelft.utils.compute_metrics import compute_pd_pfa
 from radelft.data_preparation import data_preparation
-from train2d import RaDelftWrapper
 # ==========================================
 # 辅助函数：计算 Chamfer Distance (2D)
 # ==========================================
@@ -127,7 +126,6 @@ def main():
                         default='./checkpoints/run_20260317_013246/best_epoch_11_loss_0.0118.pth')
     parser.add_argument('--output_dir', type=str, default='./results')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--test_version', type=str, default='1.0')
     parser.add_argument('--max_frames', type=int, default=10,
                         help='Maximum frames to visualize')
     args = parser.parse_args()
@@ -154,17 +152,6 @@ def main():
     sin_theta = np.clip(wx_vec / (2 * np.pi * 0.4972), -1.0, 1.0)
     azimuth_axis = np.arcsin(sin_theta)
 
-    #CFAR 参数设置
-    cfar_win_size = 7      # 
-    cfar_guard_size = 3     # 
-    cfar_kernel = torch.ones((1, 1, cfar_win_size, cfar_win_size), dtype=torch.float32, device=args.device)
-    center = cfar_win_size // 2
-    g_half = cfar_guard_size // 2
-    cfar_kernel[:, :, center-g_half : center+g_half+1, center-g_half : center+g_half+1] = 0
-    num_train_cells = cfar_kernel.sum().item()
-    cfar_alpha = 2.0
-    pad_cfar = cfar_win_size // 2
-
     print("="*70)
     print("启动测试推理与可视化")
     print(f" 加载模型: {args.checkpoint_path}")
@@ -178,12 +165,11 @@ def main():
     params["test_scenes"] = [2, 6]  # 仅测试集
     params["bev"]=True
     
-    test_dataset = RaDelftWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
+    test_dataset = RADCUBE_DATASET(mode='test', params=params)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     # 3. 初始化模型并加载权重
-    # model = old2DModel(in_channels=2).to(args.device)
-    model = MaxPower2DModel(model=CustomUNetPlusPlus,in_channels=2).to(args.device)
+    model = HRNetV1_W18().to(args.device)
     
     # 解析字典并加载权重
     checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
@@ -211,85 +197,28 @@ def main():
     # 5. 推理循环
     with torch.no_grad():
         for batch_idx, batch_data in enumerate(tqdm(test_loader, desc="Testing & Plotting")):
-            radar_cube = batch_data['radar_cube'].to(args.device)
-            occupancy_target = batch_data['occupancy_target']
+            radar_cube, occupancy_target, item_params = batch_data
+            radar_cube = radar_cube.to(args.device)
             
-            # 压缩 Z 轴 -> 2D GT
-            # occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
-            occupancy_target_2d = occupancy_target.to(args.device)
+            # 2D GT (already collapsed by RADCUBE_DATASET with bev=True)
+            occupancy_target = occupancy_target.to(args.device)
             
             # 模型前向传播
-            outputs = model(radar_cube)
-            
-            # 维度截取 (根据你验证集的代码逻辑)
-            occupancy_logits = outputs['occupancy_prob'].unsqueeze(0) # (B, 1, R, A)
-            occupancy_logits = occupancy_logits[:, :-12, 8:-8]
-            radar_energy = outputs['ra_energy'][:, :-12, 8:-8] if outputs['ra_energy'].dim() == 3 else outputs['ra_energy'][:, 0, :-12, 8:-8]
-            
-            occupancy_logits = occupancy_logits.unsqueeze(1) # (B, 1, R, A)
-            radar_energy_4d = radar_energy.unsqueeze(1)      # (B, 1, R, A)
-            
-            # 计算 pred 和 bgenergy
-            pred = 1.0 - occupancy_logits
+            occupancy_prob = model(radar_cube)['occupancy_prob'][:, :-12, 8:-8]  # (B, 500, 240)
+            final_pred_2d = occupancy_prob > 0.5  # 阈值 0.5 二值化
 
-            if args.test_version == '1.0':
-                bgenergy = pred * radar_energy_4d
-                
-                # 计算局部背景噪声
-                kernel_size = 7
-                pad = kernel_size // 2
-                bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
-                local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
-                # 最终的二值化预测首先尝试了 TopK 的方式，替换了原来的逻辑。
+            # 雷达能量（仅用于可视化）
+            ra_energy = torch.max(radar_cube[:, :-12, :, 8:-8], dim=2).values  # (B, 500, 240)
 
-
-                alpha = 2.5
-                final_pred_2d = radar_energy_4d > (alpha * local_bg_noise_sum)
-                bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
-            
-            if args.test_version == '2.0':
-                kernel_size = 5
-                pad = kernel_size // 2
-                N = kernel_size * kernel_size  # 窗口内总点数
-                k = 15  # 取背景置信度最高的 10 个点 (必须 k < N)
-
-                B, C, R, A = radar_energy_4d.shape
-                pred_bg_padded = F.pad(pred, (pad, pad, pad, pad), mode='replicate')
-                energy_padded = F.pad(radar_energy_4d, (pad, pad, pad, pad), mode='replicate')
-
-                pred_unfold = F.unfold(pred_bg_padded, kernel_size=kernel_size, padding=0)
-                energy_unfold = F.unfold(energy_padded, kernel_size=kernel_size, padding=0)
-
-                topk_bg_probs, topk_indices = torch.topk(pred_unfold, k=k, dim=1, largest=True)
-                topk_energies = torch.gather(energy_unfold, dim=1, index=topk_indices)
-                local_bg_noise_unfold = topk_energies.mean(dim=1)  # 形状: (B, R * A)
-                local_bg_noise_mean = local_bg_noise_unfold.view(B, 1, R, A)
-
-                alpha = 1.5
-                final_pred_2d = radar_energy_4d > (alpha * local_bg_noise_mean)
-                # final_pred_2d = final_pred_2d.squeeze(1) # (B, R, A)
-
-            #CFAR
-            radar_energy_pad= F.pad(radar_energy_4d, (pad_cfar, pad_cfar, pad_cfar, pad_cfar), mode='replicate')    
-            cfar_noise_sum = F.conv2d(radar_energy_pad, cfar_kernel, padding=0)
-            cfar_noise_mean = cfar_noise_sum / num_train_cells
-            cfar_pred = (radar_energy_4d > (cfar_alpha * cfar_noise_mean))
-            # ==============================
-            # 数据转换为 Numpy (去除 B 和 C 维度)
-            # ==============================
-            nndirect=occupancy_logits>0.5
-            nndirect=nndirect.squeeze().cpu().numpy()
-            gt_np = occupancy_target_2d.squeeze().cpu().numpy()
-            radar_energy_np = radar_energy_4d.squeeze().cpu().numpy()
-            pred_np = pred.squeeze().cpu().numpy()
-            
+            # 转换为 Numpy
+            gt_np = occupancy_target.squeeze().cpu().numpy()
             final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
-            cfar_pred_np = cfar_pred.squeeze().cpu().numpy().astype(np.float32)
+            radar_energy_np = ra_energy.squeeze().cpu().numpy()
             # 获取元数据信息用于命名
-            meta = batch_data['metadata']
-            scene_id = meta.get('scene', [f'unk_{batch_idx}'])[0]
+            meta = item_params[0]  # batch_size=1, first sample
+            scene_id = meta.get('scene', f'unk_{batch_idx}')
             if isinstance(scene_id, torch.Tensor): scene_id = scene_id.item()
-            frame_id = meta.get('frame', [batch_idx])[0]
+            frame_id = meta.get('frame', batch_idx)
             if isinstance(frame_id, torch.Tensor): frame_id = frame_id.item()
 
             title_info = f"Scene: {scene_id} | Frame: {frame_id}"
@@ -305,17 +234,11 @@ def main():
             X = R * np.sin(THETA)
             Y = R * np.cos(THETA)
 
-            pred_pc_x = X[final_pred_np>0.5]
-            pred_pc_y = Y[final_pred_np>0.5]
+            pred_pc_x = X[final_pred_np > 0.5]
+            pred_pc_y = Y[final_pred_np > 0.5]
 
-            gt_pc_x = X[gt_np>0.5]
-            gt_pc_y = Y[gt_np>0.5]
-
-            cfar_pc_x = X[cfar_pred_np>0.5]
-            cfar_pc_y = Y[cfar_pred_np>0.5]
-
-            nndirect_x=X[nndirect>0.5]
-            nndirect_y=Y[nndirect>0.5]
+            gt_pc_x = X[gt_np > 0.5]
+            gt_pc_y = Y[gt_np > 0.5]
 
             # TP / FP / FN 掩码与坐标
             tp_mask = (final_pred_np > 0.5) & (gt_np > 0.5)
@@ -332,7 +255,6 @@ def main():
             cd_val = compute_chamfer_distance(gt_pc_array, pred_pc_array)
             print(f"{title_info} -> Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}")
             metrics_records.append({
-                'Alpha': alpha,
                 'Frame': frame_id,
                 'Pd': pd_val,
                 'Pfa': pfa_val,
@@ -344,7 +266,7 @@ def main():
             # ==============================
             layout = [
             ["camera", "camera", "camera", "radar_energy"],
-            ["cfar_pred", "bg_noise", "final_pred_pc", "gt_pc"],
+            ["nn_direct", "nn_direct", "final_pred_pc", "gt_pc"],
             ["tp_points", "fp_points", "fn_points", "combined"],
             ]
 
@@ -356,7 +278,7 @@ def main():
             # 3. 渲染循环 (替换你原有的 imshow 逻辑)
             # ==========================================
             # 假设 radar_energy_np, pred_np 等数据的 shape 是 (len(range_axis), len(azimuth_axis))
-            cam_path = batch_data['metadata']['cam_path'][0]
+            cam_path = item_params[0]['cam_path']
             img = plt.imread(cam_path)
             img = img[500:-150, :, :]
             img = np.fliplr(img)
@@ -377,23 +299,11 @@ def main():
             # axd["pred_prob"].set_title("Pred (Probability)")
             # plt.colorbar(im1, ax=axd["pred_prob"], fraction=0.046, pad=0.04)
 
-           # CFAR
-            # axd["cfar_pred"].scatter(cfar_pc_x, cfar_pc_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
-            # axd["cfar_pred"].set_title("CFAR Pred (Point Cloud)")
-
-
-            axd["cfar_pred"].scatter(nndirect_x, nndirect_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
-            axd["cfar_pred"].set_title("nndirect")
-
-
-
-
-            # 3. Local BG Noise Sum
-            if args.test_version == '1.0':
-                bg_noise_db = 10 * np.log10(bg_noise_np + 1e-9) + 39.54
-                im2 = axd["bg_noise"].pcolormesh(X, Y, bg_noise_db, cmap='jet', shading='gouraud')
-                axd["bg_noise"].set_title("Threshold")
-                plt.colorbar(im2, ax=axd["bg_noise"], fraction=0.046, pad=0.04)
+            nndirect_np = occupancy_prob.squeeze().cpu().numpy() > 0.5
+            nn_x = X[nndirect_np > 0.5]
+            nn_y = Y[nndirect_np > 0.5]
+            axd["nn_direct"].scatter(nn_x, nn_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
+            axd["nn_direct"].set_title("NN Direct (prob > 0.5)")
 
             # 4. Final Pred 2D
             axd["final_pred_pc"].scatter(pred_pc_x, pred_pc_y, s=3, c='red', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
@@ -419,7 +329,7 @@ def main():
             axd["combined"].set_title(f"Combined (TP={len(tp_x)} / FP={len(fp_x)} / FN={len(fn_x)})")
 
             # 统一调整所有子图的坐标轴表现
-            for key in ["radar_energy", "cfar_pred", "bg_noise", "final_pred_pc", "gt_pc",
+            for key in ["radar_energy", "nn_direct", "final_pred_pc", "gt_pc",
                         "tp_points", "fp_points", "fn_points", "combined"]:
                 axd[key].set_aspect('equal')
                 # 严格看齐你代码的横向视野 (-30m 到 30m)

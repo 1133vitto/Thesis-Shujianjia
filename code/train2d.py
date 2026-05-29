@@ -6,108 +6,28 @@ import sys
 import os
 import datetime
 from pathlib import Path
-import torch.nn.functional as F
 current_dir = Path(__file__).resolve().parent
 radelft_dir = current_dir / "radelft"
 sys.path.insert(0, str(radelft_dir)) 
 sys.path.insert(0, str(current_dir))
 import torch
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import numpy as np
 import os
 import argparse
 from tqdm import tqdm  
-from radelft.utils.compute_metrics import compute_metrics_time, compute_pd_pfa
+from radelft.utils.compute_metrics import compute_pd_pfa
 import torchvision.transforms.functional as TF
 import wandb
 
 
-from model import FastFusionModel, MaxPower2DModel, CustomUNet, CustomUNetPlusPlus, CustomUNet3Plus
-from losses import RadarFusionLoss
+from model import HRNetV1_W18
+from losses import PixelWiseNPLoss
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 
-try:
-    from evaluation import Evaluator
-    HAS_EXTERNAL_EVALUATOR = True
-except ImportError:
-    HAS_EXTERNAL_EVALUATOR = False
-    print("未找到外部 Evaluator，将使用内置的")
 
 torch.set_float32_matmul_precision('medium')
-
-class RaDelftWrapper(Dataset):
-    """
-    need to be modify later
-    """
-    def __init__(self, mode='train', params=None):
-        # the same Dataset used in radelft
-        self.real_dataset = RADCUBE_DATASET(mode=mode, params=params)
-
-    def __len__(self):
-        return len(self.real_dataset)
-
-    def __getitem__(self, idx):
-        
-        input_cube, gt_cube, item_params = self.real_dataset[idx]
-        
-        # 1. seperate Elevation /Power
-        #  input_cube  (2, 128, 512, 256) -> (Channel, Doppler, Range, Azimuth)
-        # index 0 refers to Power
-        power_cube = input_cube #  (128, 512, 256)
-        # elevation_cube = input_cube[1] # (128, 512, 256) 
-        
-        # 2. adjust the order
-        # 
-        power_cube = np.transpose(power_cube, (1, 0, 2)) #  (512, 128, 256)
-        # elevation_cube = np.transpose(elevation_cube, (1, 0, 2))
-        
-        # range_cell_size = 0.1004
-        # max_range = 51.4242
-        # range_axis = np.arange(range_cell_size, max_range + range_cell_size, range_cell_size)
-        # range_axis = range_axis[10:-3]
-        # # Azimuth Axis 
-        # angle_fft_size = 256 
-        # wx_vec = np.linspace(-np.pi, np.pi, angle_fft_size) 
-        # wx_vec = wx_vec[8:248] 
-        # azimuth_axis = np.arcsin(wx_vec / (2 * np.pi * 0.4972))
-        # # Elevation Axis 
-        # ele_fft_size = 128 
-        # wz_vec = np.linspace(-np.pi, np.pi, ele_fft_size) 
-        # wz_vec = wz_vec[47:81] 
-        # elevation_axis = np.arcsin(wz_vec / (2 * np.pi * 0.4972))
-
-        # E = elevation_axis          # (34,)
-        # R = range_axis             # (500,)
-        # A = azimuth_axis           # (240,)
-
-        # E_grid, R_grid, A_grid = np.meshgrid(E, R, A, indexing='ij')
-
-        # # 坐标变换
-        # Z = R_grid * np.sin(E_grid)
-        # X = R_grid * np.cos(E_grid) * np.cos(A_grid)
-        # Y = R_grid * np.cos(E_grid) * np.sin(A_grid)
-        # z_min = -1.0   # 地面以下一点
-        # z_max = 2.5    # SUV / truck 上限
-        # mask = (Z >= z_min) & (Z <= z_max)
-        # gt_filtered = gt_cube * mask
-
-
-
-        # occupancy_target = np.max(gt_filtered, axis=0)  # (500, 240)
-        # occupancy_target = (occupancy_target > 0).astype(np.float32)  # 二值化
-        # 
-        occupancy_target = np.squeeze(gt_cube) #(500, 240)
-
-        
-        return {
-            'radar_cube': torch.from_numpy(power_cube).float(),
-            # 'elevation_cube': torch.from_numpy(elevation_cube).float(),
-            'occupancy_target': torch.from_numpy(occupancy_target).float(),
-            'metadata': item_params  
-        }
-
-
 
 # ==========================================
 # 训练主函数
@@ -126,11 +46,9 @@ def main():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=42, help='随机种子，确保结果可复现')
-    parser.add_argument('--model', type=str, default='CustomUNetPlusPlus', help='选择模型类型')
-
     args = parser.parse_args()
     
-    wandb.init(project="model v1.0", name=args.name)
+    wandb.init(project="idea4", name=args.name)
 
     print("="*70)
     print("启动2d训练")
@@ -145,47 +63,25 @@ def main():
     print(f"本次训练的所有权重将保存在: {save_dir}")
     # os.makedirs(args.save_dir, exist_ok=True)
     
-    #load the data
-    if args.use_radelft:
-        # RaDelft
-        from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
-        from radelft.data_preparation import data_preparation
-        params = data_preparation.get_default_params()
-        params["dataset_path"] = '/scratch/shujianjia/dataset/'
-        params["train_val_scenes"] = [1,3,4,5,7]
-        params["test_scenes"] = [2,6]
-        params["bev"] = True
-        train_dataset = RaDelftWrapper(mode='train', params=params)
-        val_dataset = RaDelftWrapper(mode='val', params=params)
-    # else:
-    #     train_dataset = SafeMockDataset(num_samples=200, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
-    #     val_dataset = SafeMockDataset(num_samples=40, range_bins=args.range_bins, doppler_bins=args.doppler_bins, angle_bins=args.angle_bins)
-    
+    # load data: RADCUBE_DATASET with bev=True already returns (D,R,A) input and 2D occupancy GT
+    from radelft.data_preparation import data_preparation
+    params = data_preparation.get_default_params()
+    params["dataset_path"] = '/scratch/shujianjia/dataset/'
+    params["train_val_scenes"] = [1,3,4,5,7]
+    params["test_scenes"] = [2,6]
+    params["bev"] = True
+    train_dataset = RADCUBE_DATASET(mode='train', params=params)
+    val_dataset = RADCUBE_DATASET(mode='val', params=params)
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers if args.device=='cuda' else 0)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,num_workers=args.workers if args.device=='cuda' else 0)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers if args.device=='cuda' else 0)
     
     # 2. model
-    # model = FastFusionModel(
-    #     angle_bins=args.angle_bins,
-    #     doppler_channels=128
-    # ).to(args.device)
-    MODEL_REGISTRY = {
-    'CustomUNet': CustomUNet,
-    'CustomUNetPlusPlus': CustomUNetPlusPlus,
-    'CustomUNet3Plus': CustomUNet3Plus,
-    }
-    model_class =MODEL_REGISTRY[args.model]
-
-    model = MaxPower2DModel(
-        model=model_class,
-        in_channels=2
-    ).to(args.device)
-    print(f"模型使用：{args.model}")
-    
-    # model.unet.freeze_backbone()
+    model = HRNetV1_W18().to(args.device)
+    print("模型使用：HRNetV1_W18 (full-resolution)")
 
     # 3.  Loss
-    criterion = RadarFusionLoss(weight_focal=1.0, weight_dice=0,weight_cfar=0) # 先不考虑 quantile loss
+    criterion = PixelWiseNPLoss(epsilon=1e-6)
     
     # 4. optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4) # AdamW 比 Adam 更利于泛化
@@ -198,12 +94,6 @@ def main():
     # break to test validation loop
     step=0
 
-    kernel_size=[1, 5]
-    sigma=[0.1, 2.0]
-    dummy_point = torch.zeros(1, 1, 31, kernel_size[1])
-    dummy_point[0, 0, 15, kernel_size[1]//2] = 1.0
-    # 获取孤立单点模糊后的最大值 (比如 0.4)
-    W_c = TF.gaussian_blur(dummy_point, kernel_size=kernel_size, sigma=sigma).max()
     # 5. training loop
     for epoch in range(args.num_epochs):
         model.train()
@@ -212,61 +102,38 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{args.num_epochs}] Train")
         
         for batch_data in pbar:
-            radar_cube = batch_data['radar_cube'].to(args.device)
-            occupancy_target = batch_data['occupancy_target']
-            if len(occupancy_target.shape) == 4:
-                # height find max, 34 layers -> 1 layer
-                # collapse the height dimension by taking the maximum value across it, resulting in a 2D occupancy map
-                occupancy_target, _ = torch.max(occupancy_target, dim=1)
-            occupancy_target=occupancy_target.to(args.device)
+            radar_cube, occupancy_target, _ = batch_data
+            radar_cube = radar_cube.to(args.device)
+            occupancy_target = occupancy_target.to(args.device)
             optimizer.zero_grad()
             
             # forward
-            outputs = model(radar_cube)
-            occupancy_prob = outputs['occupancy_prob'][:, :-12, 8:-8]
-            occupancy_logits = outputs['occupancy_logits'][:, :-12, 8:-8]
-            radar_energy = outputs['ra_energy'][:, :, :-12, 8:-8]#( B, 1, R, A  )
-            # quantile_preds = outputs['quantiles'][..., :-12, 8:-8]
-            # radar_energy = outputs['ra_energy'][..., :-12, 8:-8]
-            occupancy_target = occupancy_target.unsqueeze(1) #(B, 1, R, A)
-            # print(f"occupancy_target shape: {occupancy_target.shape}")
-            soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
-            scaled=soft_targets / W_c
-            soft_targets = torch.clamp(scaled, min=0, max=1.0)  # 将
-            final_targets = torch.max(occupancy_target, soft_targets)
-            # batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
-            # batch_max = batch_max.view(-1, 1, 1, 1)
-            # soft_targets_norm = soft_targets / (batch_max + 1e-8)
-            soft_targets = final_targets.squeeze(1) #(B, R, A)
+            occupancy_prob = model(radar_cube)['occupancy_prob']  # (B, 512, 256)
+            occupancy_prob_cropped = occupancy_prob[:, :-12, 8:-8]  # (B, 500, 240)
 
+            # soft targets: Gaussian blur along azimuth for spatial alignment
+            occupancy_target = occupancy_target.unsqueeze(1)  # (B, 1, R, A)
 
-
-
-
-            loss_dict = criterion(
-                occupancy_logits=occupancy_logits,
-                # quantile_preds=quantile_preds,
-                occupancy_target=soft_targets,
-                radar_energy=radar_energy
+            # mid-training regularization switch
+            use_reg = (epoch >= args.num_epochs // 2)
+            loss = criterion(
+                occupancy_prob_cropped,
+                occupancy_target,
+                use_regularization=use_reg,
+                lambda_reg=1,
+                false_alarm_set=0.02,
             )
-            
-            loss = loss_dict['total_loss']
+
             loss.backward()
-            
+
             # gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            
+
             optimizer.step()
-            
+
             total_train_loss += loss.item()
-            
-            pbar.set_postfix({
-                'Tot': f"{loss.item():.3f}",
-                'Foc': f"{loss_dict['focal_loss'].item():.3f}"
-                # 'Dice': f"{loss_dict['dice_loss'].item():.3f}",
-                # 'CFAR': f"{loss_dict['cfar_loss'].item():.3f}",
-                # 'Qnt': f"{loss_dict['quantile_loss'].item():.3f}"
-            })
+
+            pbar.set_postfix({'Loss': f"{loss.item():.3f}"})
             # wandb.log({"epoch": epoch, "loss": loss})
             # step+=1
             # if step>2:
@@ -281,68 +148,26 @@ def main():
         count=0
         with torch.no_grad():
             for batch_data in val_loader:
-                radar_cube = batch_data['radar_cube'].to(args.device) # (B, 512, 128, 256)
-                occupancy_target = batch_data['occupancy_target']
+                radar_cube, occupancy_target, _ = batch_data
+                radar_cube = radar_cube.to(args.device)
 
                 # occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
                 occupancy_target_2d=occupancy_target.to(args.device)
                 # occupancy_target_3d=occupancy_target.to(args.device)
                 # occupancy_target = batch_data['occupancy_target'].to(args.device)
-                outputs = model(radar_cube)
-                
-                occupancy_logits = outputs['occupancy_logits'][:,  :-12, 8:-8]
-                occupancy_prob = outputs['occupancy_prob'][:, :-12, 8:-8]
-                radar_energy = outputs['ra_energy'][:, :, :-12, 8:-8]
-                
-                # qback_est=outputs['background_est'][:, :-12, 8:-8]
+                occupancy_prob = model(radar_cube)['occupancy_prob'][:, :-12, 8:-8]  # (B, 500, 240)
 
-                radar_cube_real = radar_cube[:, :-12, :, 8:-8]
-
-                occupancy_target = occupancy_target_2d.unsqueeze(1) #(B, 1, R, A)
-                # print(f"occupancy_target shape: {occupancy_target.shape}")
-                soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
-                # batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
-                # batch_max = batch_max.view(-1, 1, 1, 1)
-                # soft_targets_norm = soft_targets / (batch_max + 1e-8)
-                scaled=soft_targets / W_c
-                soft_targets = torch.clamp(scaled, min=0, max=1.0)  # 将
-                final_targets = torch.max(occupancy_target, soft_targets)
-                soft_targets = final_targets.squeeze(1) #(B, R, A)
+                gt_2d = occupancy_target_2d.unsqueeze(1)  # (B, 1, R, A)
                 
                 
 
 
 
 
-                loss_dict = criterion(
-                occupancy_logits=occupancy_logits,
-                # quantile_preds=quantile_preds,
-                occupancy_target=soft_targets,
-                radar_energy=radar_energy
-                )
-                total_val_loss += loss_dict['total_loss'].item()
+                loss = criterion(occupancy_prob, gt_2d)
+                total_val_loss += loss.item()
 
-                pred=1.0-occupancy_prob.unsqueeze(1)
-                bgenergy=pred*radar_energy
-                # print(f"radar_energy.shape: {radar_energy.shape} | bgenergy.shape: {bgenergy.shape}, occupancy_logits.shape: {occupancy_logits.shape}")
-                kernel_size = 5
-                pad = kernel_size // 2
-            
-                # avg pooling to get local background noise sum
-                local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=pad)
-                # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
-
-                # local_bg_noise_mean = local_bg_noise_sum / (local_bg_weight_sum + 1e-5)
-                alpha=2.0
-                final_pred_2d = radar_energy > (alpha * local_bg_noise_sum)
-                
-
-
-                
-                final_pred_2d = final_pred_2d.squeeze()
-                # B, R, A = final_pred_2d.shape
-                max_doppler_idx=outputs['max_indices'][:, :-12, 8:-8] #(B, 500, 240)
-                # max_doppler_idx = torch.argmax(radar_cube_real, dim=2)#(B, 500, 240)
+                final_pred_2d = (occupancy_prob > 0.5).float()
 
 
                 gt_2d_numpy = occupancy_target_2d.cpu().detach().numpy()
