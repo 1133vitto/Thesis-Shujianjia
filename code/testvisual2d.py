@@ -128,10 +128,12 @@ def main():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--max_frames', type=int, default=10,
                         help='Maximum frames to visualize')
+    parser.add_argument('--workers', type=int, default=2,
+                        help='Number of worker threads to use for data loading')
     args = parser.parse_args()
     
     # 1. 创建输出目录
-    vis_dir = os.path.join(args.output_dir, '细分点云unet502')
+    vis_dir = os.path.join(args.output_dir, '511第一次可视化')
     os.makedirs(vis_dir, exist_ok=True)
     
     # Range Axis
@@ -166,7 +168,7 @@ def main():
     params["bev"]=True
     
     test_dataset = RADCUBE_DATASET(mode='test', params=params)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=args.workers)
 
     # 3. 初始化模型并加载权重
     model = HRNetV1_W18().to(args.device)
@@ -179,7 +181,7 @@ def main():
         model.load_state_dict(checkpoint)
     
     model.eval()
-    dummy_input = torch.randn(1, 512, 128, 256).to(args.device) # 根据你的模型输入维度调整
+    dummy_input = torch.randn(1, 128, 512, 256).to(args.device) # 根据你的模型输入维度调整
     macs, params = profile(model, inputs=(dummy_input, ))
 
     # 4. 格式化输出，让它看起来更直观 (比如变成 M, G 等单位)
@@ -208,14 +210,17 @@ def main():
             final_pred_2d = occupancy_prob > 0.5  # 阈值 0.5 二值化
 
             # 雷达能量（仅用于可视化）
-            ra_energy = torch.max(radar_cube[:, :-12, :, 8:-8], dim=2).values  # (B, 500, 240)
+            radar_energy_full = radar_cube.max(dim=1)[0]
+            if radar_energy_full.shape[-2:] == (512, 256):
+                radar_energy_np = radar_energy_full[:, :-12, 8:-8].squeeze().cpu().numpy()
+            else:
+                radar_energy_np = radar_energy_full.squeeze().cpu().numpy() # (B, 500, 240)
 
             # 转换为 Numpy
             gt_np = occupancy_target.squeeze().cpu().numpy()
             final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
-            radar_energy_np = ra_energy.squeeze().cpu().numpy()
             # 获取元数据信息用于命名
-            meta = item_params[0]  # batch_size=1, first sample
+            meta = item_params  # batch_size=1, first sample
             scene_id = meta.get('scene', f'unk_{batch_idx}')
             if isinstance(scene_id, torch.Tensor): scene_id = scene_id.item()
             frame_id = meta.get('frame', batch_idx)
@@ -278,7 +283,7 @@ def main():
             # 3. 渲染循环 (替换你原有的 imshow 逻辑)
             # ==========================================
             # 假设 radar_energy_np, pred_np 等数据的 shape 是 (len(range_axis), len(azimuth_axis))
-            cam_path = item_params[0]['cam_path']
+            cam_path = meta.get('cam_path', [None])[0]
             img = plt.imread(cam_path)
             img = img[500:-150, :, :]
             img = np.fliplr(img)
@@ -339,12 +344,11 @@ def main():
                 
                 axd[key].set_xlabel('x - Lateral (m)')
                 axd[key].set_ylabel('y - Forward (m)')
-                axd[key].grid(True, linestyle=':', alpha=0.6) # 加个极淡的网格辅助看距离，不破坏画面
 
             # plt.tight_layout()
 
             # 保存图片
-            save_path = os.path.join(vis_dir, f"alpha_{alpha}_frame_{frame_id}_bev.png")
+            save_path = os.path.join(vis_dir, f"_frame_{frame_id}_bev.png")
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             plt.close(fig) # 防止内存泄漏
 

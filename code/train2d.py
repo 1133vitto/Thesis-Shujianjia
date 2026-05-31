@@ -115,19 +115,19 @@ def main():
             occupancy_target = occupancy_target.unsqueeze(1)  # (B, 1, R, A)
 
             # mid-training regularization switch
-            use_reg = (epoch >= args.num_epochs // 2)
+            use_reg = (epoch >= args.num_epochs // 5)
             loss = criterion(
                 occupancy_prob_cropped,
                 occupancy_target,
                 use_regularization=use_reg,
                 lambda_reg=1,
-                false_alarm_set=0.02,
+                pfa_set=0.02,
             )
 
             loss.backward()
 
             # gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             optimizer.step()
 
@@ -164,7 +164,7 @@ def main():
 
 
 
-                loss = criterion(occupancy_prob, gt_2d)
+                loss = criterion(occupancy_prob, gt_2d, pfa_set=0.02)  
                 total_val_loss += loss.item()
 
                 final_pred_2d = (occupancy_prob > 0.5).float()

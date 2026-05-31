@@ -78,20 +78,12 @@ class BasicBlock(nn.Module):
 class HighResolutionModule(nn.Module):
     """
     Multi-resolution cross-fusion.
-
-    Takes N feature maps at different resolutions, fuses them via
-    element-wise SUM, and outputs N feature maps at the same resolutions.
-
-    Parameters:
-        num_branches: number of parallel branches
-        channels_list: list of channel counts per branch [c0, c1, ..., c_{N-1}]
     """
     def __init__(self, num_branches, channels_list):
         super().__init__()
         self.num_branches = num_branches
         self.channels_list = channels_list
 
-        # fuse_layers[i][j]: transform input branch j → output resolution i
         self.fuse_layers = nn.ModuleList()
         for i in range(num_branches):
             row = nn.ModuleList()
@@ -103,13 +95,14 @@ class HighResolutionModule(nn.Module):
                     row.append(nn.Identity())
 
                 elif j > i:
-                    # j is coarser → upsample (j-i) times to reach resolution i
+                    # j is coarser → upsample to reach resolution i
+                    # 彻底干掉以前的 for 循环拼接，一次缩放解决战斗，这就是“好品味”
+                    scale = 2 ** (j - i)
                     layers = [
                         nn.Conv2d(in_ch, out_ch, 1, bias=False),
                         nn.BatchNorm2d(out_ch),
+                        nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False)
                     ]
-                    for _ in range(j - i):
-                        layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
                     row.append(nn.Sequential(*layers))
 
                 else:  # j < i
@@ -127,12 +120,6 @@ class HighResolutionModule(nn.Module):
             self.fuse_layers.append(row)
 
     def forward(self, x):
-        """
-        Args:
-            x: list of N tensors at decreasing resolutions
-        Returns:
-            list of N tensors at the same resolutions, fused
-        """
         out = []
         for i in range(self.num_branches):
             fused = self.fuse_layers[i][0](x[0])
@@ -144,11 +131,10 @@ class HighResolutionModule(nn.Module):
 
 class HRNetV1_W18(nn.Module):
     """
-    HRNetV1-W18, full-resolution version.
-
-    The highest-resolution branch stays at the input resolution (512x256)
-    throughout the entire network. No stem downsampling.
-    V1 head uses only the highest-resolution branch for the final output.
+    HRNetV1-W18, Refactored for Pragmatic Memory Usage.
+    
+    Stem downsamples 2x to save immense memory. 
+    Final output maps back to original resolution to strictly preserve userspace interface.
 
     Input:  radar_cube (B, 512, 128, 256)  [Range, Doppler, Azimuth]
     Output: dict with 'occupancy_prob': (B, 512, 256), values in [0, 1]
@@ -158,12 +144,11 @@ class HRNetV1_W18(nn.Module):
         super().__init__()
 
         # ---- Step 0: Doppler compression ----
-        # (B, 512, 128, 256) -> permute -> (B, 128, 512, 256) -> Conv1x1 -> (B, 3, 512, 256)
         self.doppler_conv = nn.Conv2d(128, 3, kernel_size=1, stride=1)
 
-        # ---- Step 1: Stem (stride=1, keeps 512x256) ----
+        # ---- Step 1: Stem (stride=2, drops to 256x128) ----
         self.stem = nn.Sequential(
-            ConvBlock(3, 64, 3, 1),
+            ConvBlock(3, 64, 3, 2),  # <-- 手术刀落下的地方：空间降维 2x
             ConvBlock(64, 64, 3, 1),
         )
 
@@ -175,8 +160,8 @@ class HRNetV1_W18(nn.Module):
 
         # ---- Step 3: Transition 1 (256ch -> 2 branches) ----
         self.transition1 = nn.ModuleList([
-            ConvBlock(256, 18, 3, 1),    # Branch 0 (hr): 512x256
-            ConvBlock(256, 36, 3, 2),    # Branch 1 (mr): 256x128
+            ConvBlock(256, 18, 3, 1),    # Branch 0 (hr): 256x128
+            ConvBlock(256, 36, 3, 2),    # Branch 1 (mr): 128x64
         ])
 
         # ---- Stage 2 branch blocks ----
@@ -187,7 +172,7 @@ class HRNetV1_W18(nn.Module):
         self.stage2_fusion = HighResolutionModule(2, [18, 36])
 
         # ---- Step 5: Transition 2 (add 3rd branch from branch 1) ----
-        self.transition2 = ConvBlock(36, 72, 3, 2)   # lr: 128x64
+        self.transition2 = ConvBlock(36, 72, 3, 2)   # lr: 64x32
 
         # ---- Stage 3 branch blocks ----
         self.stage3_hr_blocks = nn.Sequential(*[BasicBlock(18, 18) for _ in range(4)])
@@ -200,7 +185,7 @@ class HRNetV1_W18(nn.Module):
         ])
 
         # ---- Step 7: Transition 3 (add 4th branch from branch 2) ----
-        self.transition3 = ConvBlock(72, 144, 3, 2)  # vlr: 64x32
+        self.transition3 = ConvBlock(72, 144, 3, 2)  # vlr: 32x16
 
         # ---- Stage 4 branch blocks ----
         self.stage4_hr_blocks = nn.Sequential(*[BasicBlock(18, 18) for _ in range(4)])
@@ -214,8 +199,11 @@ class HRNetV1_W18(nn.Module):
         ])
 
         # ---- Step 9: V1 Final Head ----
-        # Only the highest-resolution branch (18ch @ 512x256) -> 1ch
-        self.final_conv = nn.Conv2d(18, 1, kernel_size=1, stride=1)
+        # 履行向后兼容契约：提取 1ch，拉伸回 512x256
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(18, 1, kernel_size=1, stride=1),
+            nn.Upsample(size=(512, 256), mode='bilinear', align_corners=False)
+        )
 
     def forward(self, x):
         """
@@ -225,38 +213,37 @@ class HRNetV1_W18(nn.Module):
             {'occupancy_prob': (B, 512, 256)}
         """
         # Step 0: Doppler compression
-        # x is already (B, D, R, A) from RADCUBE_DATASET (bev=True)
-        x = self.doppler_conv(x)                    # Conv2d(128,3,1): (B,128,512,256) -> (B,3,512,256)
+        x = self.doppler_conv(x)                    # (B,3,512,256)
 
         # Step 1: Stem
-        x = self.stem(x)                            # (B, 64, 512, 256)
+        x = self.stem(x)                            # (B, 64, 256, 128)  <- 显存债务在这里被砍掉 75%
 
         # Step 2: Stage 1
-        x = self.stage1(x)                          # (B, 256, 512, 256)
+        x = self.stage1(x)                          # (B, 256, 256, 128)
 
-        # Step 3: Transition 1 -> 2 branches
-        hr = self.transition1[0](x)                 # (B, 18, 512, 256)
-        mr = self.transition1[1](x)                 # (B, 36, 256, 128)
+        # Step 3: Transition 1
+        hr = self.transition1[0](x)                 # (B, 18, 256, 128)
+        mr = self.transition1[1](x)                 # (B, 36, 128, 64)
 
         # Step 4: Stage 2
         hr, mr = self.stage2_fusion([hr, mr])
         hr = self.stage2_hr_blocks(hr)
         mr = self.stage2_mr_blocks(mr)
 
-        # Step 5: Transition 2 -> 3 branches
-        lr = self.transition2(mr)                   # (B, 72, 128, 64)
+        # Step 5: Transition 2
+        lr = self.transition2(mr)                   # (B, 72, 64, 32)
 
-        # Step 6: Stage 3 (4 fusion layers)
+        # Step 6: Stage 3
         for fusion in self.stage3_fusions:
             hr, mr, lr = fusion([hr, mr, lr])
             hr = self.stage3_hr_blocks(hr)
             mr = self.stage3_mr_blocks(mr)
             lr = self.stage3_lr_blocks(lr)
 
-        # Step 7: Transition 3 -> 4 branches
-        vlr = self.transition3(lr)                  # (B, 144, 64, 32)
+        # Step 7: Transition 3
+        vlr = self.transition3(lr)                  # (B, 144, 32, 16)
 
-        # Step 8: Stage 4 (3 fusion layers)
+        # Step 8: Stage 4
         for fusion in self.stage4_fusions:
             hr, mr, lr, vlr = fusion([hr, mr, lr, vlr])
             hr = self.stage4_hr_blocks(hr)
@@ -264,8 +251,8 @@ class HRNetV1_W18(nn.Module):
             lr = self.stage4_lr_blocks(lr)
             vlr = self.stage4_vlr_blocks(vlr)
 
-        # Step 9: V1 Head — only highest-resolution branch
-        out = self.final_conv(hr)                   # (B, 1, 512, 256)
+        # Step 9: V1 Head
+        out = self.final_conv(hr)                   # (B, 1, 512, 256) <- 插值撑回原状
         out = out.squeeze(1)                        # (B, 512, 256)
         out = torch.sigmoid(out)                    # (B, 512, 256)
 
