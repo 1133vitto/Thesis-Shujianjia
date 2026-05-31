@@ -12,8 +12,8 @@ class PixelWiseNPLoss(nn.Module):
         self.epsilon = epsilon
         self.pool_size = pool_size
         self.padding = pool_size // 2  # 保证池化后特征图大小不变
-        self.alpha = 0.95  # Focal Loss 中正负样本权重
-        self.gamma = 1.4   # Focal Loss 中调节难易样本的指数
+        self.alpha = 0.995  # Focal Loss 中正负样本权重
+        self.gamma = 2.0   # Focal Loss 中调节难易样本的指数
 
     def forward(self, preds, targets, use_regularization=False, lambda_reg=0.1, pfa_set=0.02):
         """

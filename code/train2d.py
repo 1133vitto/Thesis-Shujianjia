@@ -115,7 +115,7 @@ def main():
             occupancy_target = occupancy_target.unsqueeze(1)  # (B, 1, R, A)
 
             # mid-training regularization switch
-            use_reg = (epoch >= args.num_epochs // 5)
+            use_reg = (epoch >= args.num_epochs // 10)
             loss = criterion(
                 occupancy_prob_cropped,
                 occupancy_target,

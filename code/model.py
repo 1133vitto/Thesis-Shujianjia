@@ -50,7 +50,7 @@ class Bottleneck(nn.Module):
 
 
 class BasicBlock(nn.Module):
-    """ResNet basic block (no bottleneck). Used in Stages 2-4."""
+    """ResNet basic block (no bottleneck). Used in Stages 2-3."""
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride, 1, bias=False)
@@ -76,9 +76,7 @@ class BasicBlock(nn.Module):
 
 
 class HighResolutionModule(nn.Module):
-    """
-    Multi-resolution cross-fusion.
-    """
+    """Multi-resolution cross-fusion."""
     def __init__(self, num_branches, channels_list):
         super().__init__()
         self.num_branches = num_branches
@@ -93,10 +91,7 @@ class HighResolutionModule(nn.Module):
 
                 if j == i:
                     row.append(nn.Identity())
-
                 elif j > i:
-                    # j is coarser → upsample to reach resolution i
-                    # 彻底干掉以前的 for 循环拼接，一次缩放解决战斗，这就是“好品味”
                     scale = 2 ** (j - i)
                     layers = [
                         nn.Conv2d(in_ch, out_ch, 1, bias=False),
@@ -104,9 +99,7 @@ class HighResolutionModule(nn.Module):
                         nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False)
                     ]
                     row.append(nn.Sequential(*layers))
-
                 else:  # j < i
-                    # j is finer → downsample (i-j) times
                     layers = []
                     for k in range(i - j):
                         conv_in = in_ch if k == 0 else out_ch
@@ -116,7 +109,6 @@ class HighResolutionModule(nn.Module):
                             nn.ReLU(inplace=True),
                         ])
                     row.append(nn.Sequential(*layers))
-
             self.fuse_layers.append(row)
 
     def forward(self, x):
@@ -131,24 +123,23 @@ class HighResolutionModule(nn.Module):
 
 class HRNetV1_W18(nn.Module):
     """
-    HRNetV1-W18, Refactored for Pragmatic Memory Usage.
+    HRNetV1-W18, Pruned for Radar Physics & High-Efficiency.
     
-    Stem downsamples 2x to save immense memory. 
-    Final output maps back to original resolution to strictly preserve userspace interface.
+    去掉了毫无物理意义的 Stage 4 (144通道分支)，深度止于 Stage 3 (72通道)。
+    极大降低算力负荷，避免过度平滑，像素级守护雷达目标的边界。
 
-    Input:  radar_cube (B, 512, 128, 256)  [Range, Doppler, Azimuth]
-    Output: dict with 'occupancy_prob': (B, 512, 256), values in [0, 1]
+    Input:  radar_cube (B, 128, 512, 256)
+    Output: dict with 'occupancy_prob': (B, 512, 256)
     """
-
     def __init__(self):
         super().__init__()
 
         # ---- Step 0: Doppler compression ----
         self.doppler_conv = nn.Conv2d(128, 3, kernel_size=1, stride=1)
 
-        # ---- Step 1: Stem (stride=2, drops to 256x128) ----
+        # ---- Step 1: Stem ----
         self.stem = nn.Sequential(
-            ConvBlock(3, 64, 3, 2),  # <-- 手术刀落下的地方：空间降维 2x
+            ConvBlock(6, 64, 3, 2),  
             ConvBlock(64, 64, 3, 1),
         )
 
@@ -158,7 +149,7 @@ class HRNetV1_W18(nn.Module):
             stage1_blocks.append(Bottleneck(256, 256))
         self.stage1 = nn.Sequential(*stage1_blocks)
 
-        # ---- Step 3: Transition 1 (256ch -> 2 branches) ----
+        # ---- Step 3: Transition 1 ----
         self.transition1 = nn.ModuleList([
             ConvBlock(256, 18, 3, 1),    # Branch 0 (hr): 256x128
             ConvBlock(256, 36, 3, 2),    # Branch 1 (mr): 128x64
@@ -167,93 +158,70 @@ class HRNetV1_W18(nn.Module):
         # ---- Stage 2 branch blocks ----
         self.stage2_hr_blocks = nn.Sequential(*[BasicBlock(18, 18) for _ in range(4)])
         self.stage2_mr_blocks = nn.Sequential(*[BasicBlock(36, 36) for _ in range(4)])
-
-        # ---- Step 4: Stage 2 (1x fusion module) ----
         self.stage2_fusion = HighResolutionModule(2, [18, 36])
 
-        # ---- Step 5: Transition 2 (add 3rd branch from branch 1) ----
-        self.transition2 = ConvBlock(36, 72, 3, 2)   # lr: 64x32
+        # ---- Step 5: Transition 2 ----
+        self.transition2 = ConvBlock(36, 72, 3, 2)  # Branch 2 (lr): 64x32
 
         # ---- Stage 3 branch blocks ----
         self.stage3_hr_blocks = nn.Sequential(*[BasicBlock(18, 18) for _ in range(4)])
         self.stage3_mr_blocks = nn.Sequential(*[BasicBlock(36, 36) for _ in range(4)])
         self.stage3_lr_blocks = nn.Sequential(*[BasicBlock(72, 72) for _ in range(4)])
-
-        # ---- Step 6: Stage 3 (4x fusion modules) ----
+        
+        # Stage 3 融合模块 (深度终点站)
         self.stage3_fusions = nn.ModuleList([
             HighResolutionModule(3, [18, 36, 72]) for _ in range(4)
         ])
 
-        # ---- Step 7: Transition 3 (add 4th branch from branch 2) ----
-        self.transition3 = ConvBlock(72, 144, 3, 2)  # vlr: 32x16
+        # ✂️ 以前写在这里的 Transition 3 和 Stage 4 模块已被冷酷斩杀
 
-        # ---- Stage 4 branch blocks ----
-        self.stage4_hr_blocks = nn.Sequential(*[BasicBlock(18, 18) for _ in range(4)])
-        self.stage4_mr_blocks = nn.Sequential(*[BasicBlock(36, 36) for _ in range(4)])
-        self.stage4_lr_blocks = nn.Sequential(*[BasicBlock(72, 72) for _ in range(4)])
-        self.stage4_vlr_blocks = nn.Sequential(*[BasicBlock(144, 144) for _ in range(4)])
-
-        # ---- Step 8: Stage 4 (3x fusion modules) ----
-        self.stage4_fusions = nn.ModuleList([
-            HighResolutionModule(4, [18, 36, 72, 144]) for _ in range(3)
-        ])
-
-        # ---- Step 9: V1 Final Head ----
-        # 履行向后兼容契约：提取 1ch，拉伸回 512x256
-        self.final_conv = nn.Sequential(
-            nn.Conv2d(18, 1, kernel_size=1, stride=1),
-            nn.Upsample(size=(512, 256), mode='bilinear', align_corners=False)
-        )
+        # ---- Step 9: V1 Final Head (物理锚点对齐) ----
+        # 直接提取 Stage 3 结束后的高分辨率分支（18通道，256x128），拉伸回原图尺寸
+        self.upsample_hr = nn.Upsample(size=(512, 256), mode='bilinear', align_corners=False)
+        
+        # 20通道融合：18个语义通道 + 2个原始物理通道（Max/Mean）
+        self.final_conv = nn.Conv2d(20, 1, kernel_size=1, stride=1, bias=False)
 
     def forward(self, x):
-        """
-        Args:
-            x: radar_cube (B, 512, 128, 256)
-        Returns:
-            {'occupancy_prob': (B, 512, 256)}
-        """
-        # Step 0: Doppler compression
-        x = self.doppler_conv(x)                    # (B,3,512,256)
+        # 原始特征提取与归一化
+        x_max = torch.max(x, dim=1, keepdim=True)[0]       
+        x_mean = torch.mean(x, dim=1, keepdim=True)       
+        x_argmax = torch.argmax(x, dim=1, keepdim=True).float() / 127.0  
 
-        # Step 1: Stem
-        x = self.stem(x)                            # (B, 64, 256, 128)  <- 显存债务在这里被砍掉 75%
+        # 头部注入
+        x_conv = self.doppler_conv(x)                     
+        x = torch.cat([x_conv, x_max, x_mean, x_argmax], dim=1)  
 
-        # Step 2: Stage 1
-        x = self.stage1(x)                          # (B, 256, 256, 128)
+        # 骨干网络前向传播
+        x = self.stem(x)                                    
+        x = self.stage1(x)                                  
 
-        # Step 3: Transition 1
-        hr = self.transition1[0](x)                 # (B, 18, 256, 128)
-        mr = self.transition1[1](x)                 # (B, 36, 128, 64)
+        hr = self.transition1[0](x)                         
+        mr = self.transition1[1](x)                         
 
-        # Step 4: Stage 2
+        # Stage 2
         hr, mr = self.stage2_fusion([hr, mr])
         hr = self.stage2_hr_blocks(hr)
         mr = self.stage2_mr_blocks(mr)
 
-        # Step 5: Transition 2
-        lr = self.transition2(mr)                   # (B, 72, 64, 32)
+        # Transition 2
+        lr = self.transition2(mr)                           
 
-        # Step 6: Stage 3
+        # Stage 3 (现在的核心深度阶段)
         for fusion in self.stage3_fusions:
             hr, mr, lr = fusion([hr, mr, lr])
             hr = self.stage3_hr_blocks(hr)
             mr = self.stage3_mr_blocks(mr)
             lr = self.stage3_lr_blocks(lr)
 
-        # Step 7: Transition 3
-        vlr = self.transition3(lr)                  # (B, 144, 32, 16)
+        # ✂️ 以前在这里的 Stage 4 循环迭代已被连根拔起
 
-        # Step 8: Stage 4
-        for fusion in self.stage4_fusions:
-            hr, mr, lr, vlr = fusion([hr, mr, lr, vlr])
-            hr = self.stage4_hr_blocks(hr)
-            mr = self.stage4_mr_blocks(mr)
-            lr = self.stage4_lr_blocks(lr)
-            vlr = self.stage4_vlr_blocks(vlr)
-
-        # Step 9: V1 Head
-        out = self.final_conv(hr)                   # (B, 1, 512, 256) <- 插值撑回原状
-        out = out.squeeze(1)                        # (B, 512, 256)
-        out = torch.sigmoid(out)                    # (B, 512, 256)
+        # 尾部高分辨率对齐与最终输出
+        hr_upsampled = self.upsample_hr(hr)                # (B, 18, 512, 256)
+        out = torch.cat([hr_upsampled, x_max, x_mean], dim=1) # (B, 20, 512, 256)
+        
+        out = self.final_conv(out)                         
+        out = out.squeeze(1)                                
+        out = torch.sigmoid(out)                            
 
         return {'occupancy_prob': out}
