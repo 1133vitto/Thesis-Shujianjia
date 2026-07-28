@@ -112,17 +112,18 @@ class StableFocalLoss(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
 
-    def forward(self, pred: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pred: (Batch, Range, Angle) - model output probability (after sigmoid)
+            logits: (Batch, Range, Angle) - raw logits (before sigmoid)
             targets: (Batch, Range, Angle) - gt occupancy, 1 for target, 0 for background
         """
         # Clamp pred for numerical stability
+        pred = torch.sigmoid(logits)
         pred = pred.clamp(min=1e-6, max=1 - 1e-6)
 
         # BCE loss
-        bce_loss = F.binary_cross_entropy(pred, targets, reduction='none')
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
 
         # p_t: probability of positive class
         p_t = targets * pred + (1 - targets) * (1 - pred)
@@ -206,20 +207,26 @@ class RadarFusionLoss(nn.Module):
     """
     def __init__(self,
                  weight_focal: float = 1.0,
-                 weight_dice: float = 0,
-                 weight_cfar: float = 0,
+                 focal_loss_type: str = 'quality',
+                #  weight_dice: float = 0,
+                #  weight_cfar: float = 0,
                  # weight_quantile: float = 0.5,
                  # quantiles: list = [0.1, 0.5, 0.9]
                  ):
         super().__init__()
         self.weight_focal = weight_focal
-        self.weight_dice = weight_dice
-        self.weight_cfar = weight_cfar
+        self.focal_loss_type = focal_loss_type
+        # self.weight_dice = weight_dice
+        # self.weight_cfar = weight_cfar
 
-        # self.focal_loss = StableFocalLoss()
-        self.focal_loss = StableQualityFocalLoss()
-        self.dice_loss = DiceLoss()
-        self.cfar_loss = SoftCFARLoss(alpha=2.0, beta=10.0)
+        if focal_loss_type == 'quality':
+            self.focal_loss = StableQualityFocalLoss()
+        elif focal_loss_type == 'stable':
+            self.focal_loss = StableFocalLoss()
+        else:
+            raise ValueError(f"Unknown focal_loss_type: {focal_loss_type}")
+        # self.dice_loss = DiceLoss()
+        # self.cfar_loss = SoftCFARLoss(alpha=2.0, beta=10.0)
         # self.quantile_loss = MaskedQuantileLoss(quantiles=quantiles)
 
     def forward(self,
@@ -230,7 +237,11 @@ class RadarFusionLoss(nn.Module):
                 ) -> dict:
 
 
-        loss_focal = self.focal_loss(occupancy_logits, occupancy_target)
+        if self.focal_loss_type == 'quality':
+            loss_focal = self.focal_loss(occupancy_logits, occupancy_target)
+        else:
+            # occupancy_prob = torch.sigmoid(occupancy_logits)
+            loss_focal = self.focal_loss(occupancy_logits, occupancy_target)
         # loss_dice = self.dice_loss(occupancy_prob, occupancy_target)
         # loss_cfar = self.cfar_loss(occupancy_prob, radar_energy, occupancy_target)
 
@@ -247,3 +258,28 @@ class RadarFusionLoss(nn.Module):
             # 'cfar_loss': loss_cfar,
             # 'quantile_loss': loss_quantile
         }
+
+class AsymmetricTemperatureBottleneck(nn.Module):
+    """
+    非对称容忍边界 (ATB 2.0 - Margin Based)
+    目的：对背景区域(y=0)施加零容忍惩罚，防止Focal Loss提前躺平；
+          对目标区域(y>0)保留原始特征，维持置信度校准。
+    """
+    def __init__(self, margin=5.0, is_training_phase=True):
+        super().__init__()
+        self.margin = margin
+        self.is_training_phase = is_training_phase
+
+    def forward(self, logits, targets=None):
+        # 推理阶段，或者没有目标标签时，直接输出原始 logits
+        if not self.is_training_phase or targets is None:
+            return logits
+            
+        # 核心逻辑：只挑出绝对背景 (y == 0)
+        # 如果你的背景标签严格是 0，这里会生成一个 0/1 的掩码
+        bg_mask = (targets == 0.0).float()
+        
+        # 给背景区域强行加上 margin 惩罚，目标区域加 0
+        modulated_logits = logits + self.margin * bg_mask
+        
+        return modulated_logits

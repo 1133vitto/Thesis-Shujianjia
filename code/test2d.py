@@ -5,12 +5,14 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 from tqdm import tqdm
-from scipy.spatial.distance import cdist
 import pandas as pd
 from scipy.spatial import cKDTree
-from sklearn.neighbors import KDTree
+
+try:
+    from thop import profile as thop_profile
+except ImportError:
+    thop_profile = None
 
 # 路径设置，与你的训练脚本保持一致
 current_dir = Path(__file__).resolve().parent
@@ -18,12 +20,79 @@ radelft_dir = current_dir / "radelft"
 sys.path.insert(0, str(radelft_dir)) 
 sys.path.insert(0, str(current_dir))
 
-from model import MaxPower2DModel,CustomUNet, CustomUNetPlusPlus, CustomUNet3Plus
-from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
+from model import MaxPower2DModel, CustomUNet, CustomUNetPlusPlus, CustomUNet2Layer, CustomUNet3Plus,CustomUNet2Level,CustomUNet4Level
+from lidar_filtering import build_filtered_lidar_gt
 from radelft.utils.compute_metrics import compute_pd_pfa
 from radelft.data_preparation import data_preparation
-from scipy.ndimage import distance_transform_edt
 from train2d import RaDelftWrapper
+
+MODEL_REGISTRY = {
+    'CustomUNet': CustomUNet,
+    'CustomUNetPlusPlus': CustomUNetPlusPlus,
+    'CustomUNet2Layer': CustomUNet2Layer,
+    'CustomUNet3Plus': CustomUNet3Plus,
+    'CustomUNet2Level': CustomUNet2Level,
+    'CustomUNet4Level': CustomUNet4Level
+}
+
+
+def default_run_name(checkpoint_path):
+    checkpoint = Path(checkpoint_path)
+    parent = checkpoint.parent.name
+    stem = checkpoint.stem
+    if parent.startswith("run_"):
+        return f"{parent}_{stem}"
+    return stem
+
+
+def write_run_config(args, output_dir):
+    config_path = os.path.join(output_dir, "run_config.txt")
+    with open(config_path, "w") as f:
+        f.write(f"run_name: {args.run_name}\n")
+        f.write(f"model: {args.model}\n")
+        f.write(f"checkpoint_path: {args.checkpoint_path}\n")
+        f.write(f"train_val_scenes: {args.train_val_scenes}\n")
+        f.write(f"test_scenes: {args.test_scenes}\n")
+        f.write(f"alphas: {args.alphas}\n")
+        f.write(f"device: {args.device}\n")
+        f.write(f"filter_lidar_gt: {args.filter_lidar_gt}\n")
+    return config_path
+
+
+def profile_model(model, device):
+    dummy_input = torch.randn(1, 512, 128, 256, device=device)
+    profile = {
+        'Profile_Params': sum(p.numel() for p in model.parameters()),
+        'Profile_MACs': np.nan,
+        'Profile_FLOPs': np.nan,
+        'Profile_PeakMemoryMB': np.nan,
+    }
+
+    with torch.no_grad():
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        _ = model(dummy_input)
+
+        if thop_profile is not None:
+            macs, params = thop_profile(model, inputs=(dummy_input,), verbose=False)
+            profile['Profile_Params'] = int(params)
+            profile['Profile_MACs'] = float(macs)
+            profile['Profile_FLOPs'] = float(macs * 2)
+        else:
+            print("thop 未安装，Profile_MACs/Profile_FLOPs 将写为 NaN", flush=True)
+
+        if device.startswith('cuda'):
+            torch.cuda.synchronize()
+            profile['Profile_PeakMemoryMB'] = torch.cuda.max_memory_allocated() / (1024 ** 2)
+
+    del dummy_input
+    if device.startswith('cuda'):
+        torch.cuda.empty_cache()
+    return profile
+
+
 # ==========================================
 # 辅助函数：计算 Chamfer Distance (2D)
 # ==========================================
@@ -51,6 +120,42 @@ def compute_chamfer_distance_2d(gt_pc, pred_pc):
     mean_dist_gt_to_pred = np.mean(dist_gt_to_pred)
 
     return (mean_dist_pred_to_gt + mean_dist_gt_to_pred)
+
+
+def as_batched_map(tensor):
+    """Return a radar map as (B, R, A), matching train2d.py slicing."""
+    if tensor.dim() == 4:
+        tensor = tensor[:, 0]
+    elif tensor.dim() == 2:
+        tensor = tensor.unsqueeze(0)
+    return tensor
+
+
+def build_coordinate_grid(params, map_shape):
+    range_axis = np.asarray(params["range_axis"])
+    azimuth_axis = np.asarray(params["azimuth_axis"])
+
+    if len(range_axis) != map_shape[0] or len(azimuth_axis) != map_shape[1]:
+        raise ValueError(
+            f"Coordinate axis shape mismatch: params range/azimuth = "
+            f"({len(range_axis)}, {len(azimuth_axis)}), prediction = {map_shape}"
+        )
+
+    theta, radius = np.meshgrid(azimuth_axis, range_axis)
+    x = radius * np.sin(theta)
+    y = radius * np.cos(theta)
+    return x, y
+
+
+def metadata_value(metadata, key, default):
+    value = metadata.get(key, [default])
+    if isinstance(value, torch.Tensor):
+        value = value[0]
+    else:
+        value = value[0]
+    if isinstance(value, torch.Tensor):
+        value = value.item()
+    return value
 # def compute_chamfer_distance_2d(gt_mask, pred_mask):
 #     """
 #     计算二值图上的倒角距离。
@@ -107,56 +212,60 @@ def main():
                         default='./checkpoints/run_20260317_013246/best_epoch_11_loss_0.0118.pth')
     parser.add_argument('--output_dir', type=str, default='./results')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--model', type=str, default='CustomUNetPlusPlus', help='选择模型类型')
+    parser.add_argument('--model', type=str, default='CustomUNet2Layer',
+                        choices=sorted(MODEL_REGISTRY.keys()), help='选择模型类型')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='结果标识名；默认由 checkpoint 路径生成')
+    parser.add_argument('--train_val_scenes', type=int, nargs='+', default=[1, 3, 4, 5, 7],
+                        help='保存在 params 中的训练/验证 scene 列表')
+    parser.add_argument('--test_scenes', type=int, nargs='+', default=[2, 6])
+    parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--log_every', type=int, default=100,
+                        help='每隔多少帧打印一次进度；0 表示只打印最终结果')
+    parser.add_argument('--progress', action='store_true',
+                        help='显示 tqdm 进度条；Slurm 批任务默认不建议开启')
+    parser.add_argument('--alphas', type=float, nargs='+',
+                        default=[1.0, 1.25,1.5,1.75, 2.0,2.25, 2.5,2.75, 3.0,3.25, 3.5,3.75, 4.0])
+    parser.add_argument('--csv_name', type=str, default='test2d_metrics.csv')
+    parser.add_argument('--filter_lidar_gt', action='store_true',
+                        help='使用 z>2m 且 normalized SPAR<0.2 过滤后的 LiDAR GT')
 
     args = parser.parse_args()
+    if args.run_name is None:
+        args.run_name = default_run_name(args.checkpoint_path)
     
     # 1. 创建输出目录
-    vis_dir = os.path.join(args.output_dir, 'visualizations')
-    os.makedirs(vis_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
+    config_path = write_run_config(args, args.output_dir)
     
     print("="*70)
-    print("启动测试推理与可视化")
-    print(f" 加载模型: {args.checkpoint_path}")
-    print(f" 结果保存至: {args.output_dir}")
+    print("启动测试推理")
+    print(f" Run: {args.run_name}")
+    print(f" Model: {args.model}")
+    print(f" Checkpoint: {args.checkpoint_path}")
+    print(f" Train/Val scenes: {args.train_val_scenes}")
+    print(f" Test scenes: {args.test_scenes}")
+    print(f" Output dir: {args.output_dir}")
+    print(f" Config: {config_path}")
+    print(f" LiDAR GT filter: {'enabled' if args.filter_lidar_gt else 'disabled'}")
     print("="*70)
-
-    # Range Axis
-    range_cell_size = 0.1004
-    # MATLAB: rangeCellSize:rangeCellSize:51.4242
-    range_axis_full = np.arange(range_cell_size, 51.4242 + 1e-5, range_cell_size)
-    # MATLAB 索引 11:end-2 对应 Python 索引 10:-2
-    range_axis = range_axis_full[10:-2] 
-
-    # Azimuth Axis
-    angle_fft_size = 256
-    # MATLAB: -pi:2*pi/(angleFFTSize-1):pi 
-    wx_vec_full = np.linspace(-np.pi, np.pi, angle_fft_size)
-    wx_vec_full = wx_vec_full[::-1] # flip
-    # MATLAB 索引 9:248 对应 Python 索引 8:247
-    wx_vec = wx_vec_full[8:248]
-    # 防御性编程：避免因浮点精度导致超出 [-1, 1] 使得 arcsin 报错出现 NaN
-    sin_theta = np.clip(wx_vec / (2 * np.pi * 0.4972), -1.0, 1.0)
-    azimuth_axis = np.arcsin(sin_theta)
-
-
 
     # 2. 准备数据集 (使用 batch_size=1 以便逐帧画图)
     params = data_preparation.get_default_params()
     params["dataset_path"] = '/scratch/shujianjia/dataset/'
-    params["train_val_scenes"] = [1, 3, 4, 5, 7]
-    params["test_scenes"] = [2, 6]  # 仅测试集
+    params["train_val_scenes"] = args.train_val_scenes
+    params["test_scenes"] = args.test_scenes
     params["bev"]=True
     
     test_dataset = RaDelftWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers
+    )
 
-    MODEL_REGISTRY = {
-    'CustomUNet': CustomUNet,
-    'CustomUNetPlusPlus': CustomUNetPlusPlus,
-    'CustomUNet3Plus': CustomUNet3Plus,
-    }
-    model_class =MODEL_REGISTRY[args.model]
+    model_class = MODEL_REGISTRY[args.model]
     # 3. 初始化模型并加载权重
     model = MaxPower2DModel(model=model_class,in_channels=2).to(args.device)
     
@@ -168,6 +277,15 @@ def main():
         model.load_state_dict(checkpoint)
     
     model.eval()
+    model_profile = profile_model(model, args.device)
+    print(
+        "Profile -> "
+        f"Params: {model_profile['Profile_Params']}, "
+        f"MACs: {model_profile['Profile_MACs']}, "
+        f"FLOPs: {model_profile['Profile_FLOPs']}, "
+        f"PeakMemoryMB: {model_profile['Profile_PeakMemoryMB']:.2f}",
+        flush=True
+    )
 
     #CFAR 参数设置
     cfar_win_size = 7      # 
@@ -203,11 +321,7 @@ def main():
     # 意思是：从小到大排序，取第 75% 位置的值作为纯净背景代表
     k_index = int(0.75 * num_train_cells)
 
-    print(f"✅ OS-CFAR 初始化: 窗口={os_win_size}x{os_win_size}, 训练单元数={num_train_cells}, k取值={k_index}")
-
-    THETA, R = np.meshgrid(azimuth_axis, range_axis)
-    X = R * np.sin(THETA)
-    Y = R * np.cos(THETA)
+    print(f"OS-CFAR 初始化: 窗口={os_win_size}x{os_win_size}, 训练单元数={num_train_cells}, k取值={k_index}")
 
 
 
@@ -218,28 +332,40 @@ def main():
 
 
 
-    # 4. 
     metrics_records = []
-    test_alphas = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
-    # 5. 
+    test_alphas = args.alphas
+    coordinate_grid = None
     with torch.no_grad():
-        for batch_idx, batch_data in enumerate(tqdm(test_loader, desc="Testing & Plotting")):
+        loader_iter = tqdm(test_loader, desc=args.run_name, disable=not args.progress)
+        for batch_idx, batch_data in enumerate(loader_iter):
             radar_cube = batch_data['radar_cube'].to(args.device)
             occupancy_target = batch_data['occupancy_target']
             
             # 2D GT
             # occupancy_target_2d, _ = torch.max(occupancy_target, dim=1)
             occupancy_target_2d = occupancy_target.to(args.device)
+            if args.filter_lidar_gt:
+                occupancy_target_2d, filter_stats = build_filtered_lidar_gt(
+                    radar_cube=radar_cube,
+                    metadata=batch_data['metadata'],
+                    params=params,
+                    device=args.device,
+                )
+                if batch_idx == 0 or (args.log_every and (batch_idx + 1) % args.log_every == 0):
+                    print(
+                        f"[{args.run_name}] filtered LiDAR GT dropped "
+                        f"{filter_stats['dropped_points']}/{filter_stats['raw_points']} raw points",
+                        flush=True,
+                    )
             
             # 模型前向传播
             outputs = model(radar_cube)
             
             # 维度截取 (根据你验证集的代码逻辑)
-            occupancy_logits = outputs['occupancy_prob'].unsqueeze(0) # (B,  R, A)
-            occupancy_logits = occupancy_logits[:, :-12, 8:-8]
-            radar_energy = outputs['ra_energy'][:, :-12, 8:-8] if outputs['ra_energy'].dim() == 3 else outputs['ra_energy'][:, 0, :-12, 8:-8]
+            occupancy_prob = as_batched_map(outputs['occupancy_prob'])[:, :-12, 8:-8]
+            radar_energy = as_batched_map(outputs['ra_energy'])[:, :-12, 8:-8]
             
-            occupancy_logits = occupancy_logits.unsqueeze(1) # (B, 1, R, A)
+            occupancy_logits = occupancy_prob.unsqueeze(1) # (B, 1, R, A)
             radar_energy_4d = radar_energy.unsqueeze(1)      # (B, 1, R, A)
             
             # 计算 pred 和 bgenergy
@@ -250,12 +376,6 @@ def main():
             kernel_size = 5
             pad = kernel_size // 2
             bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
-            unfolded = F.unfold(bgenergy, kernel_size=os_win_size, padding=os_pad)
-            # valid_cells = unfolded[:, train_mask, :]
-            # local_bg_noise_sum, _ = torch.kthvalue(valid_cells, k_index, dim=1)
-            # local_bg_noise_sum = local_bg_noise_sum.view(1, 1, 500, 240)
-            # local_bg_noise_sum = F.conv2d(bgenergy, cfar_kernel, stride=1, padding=pad_cfar)
-            # local_bg_weight_sum = local_bg_noise_sum / (num_train_cells) 
             local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
             # local_bg_weight_sum = F.avg_pool2d(pred, kernel_size=kernel_size, stride=1, padding=pad)
 
@@ -271,12 +391,14 @@ def main():
             bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
             # final_pred_np = final_pred_2d.squeeze().cpu().numpy().astype(np.float32)
 
+            if coordinate_grid is None:
+                coordinate_grid = build_coordinate_grid(params, radar_energy_np.shape)
+            X, Y = coordinate_grid
+
             # 命名
             meta = batch_data['metadata']
-            scene_id = meta.get('scene', [f'unk_{batch_idx}'])[0]
-            if isinstance(scene_id, torch.Tensor): scene_id = scene_id.item()
-            frame_id = meta.get('frame', [batch_idx])[0]
-            if isinstance(frame_id, torch.Tensor): frame_id = frame_id.item()
+            scene_id = metadata_value(meta, 'scene', f'unk_{batch_idx}')
+            frame_id = metadata_value(meta, 'frame', batch_idx)
 
             title_info = f"Scene: {scene_id} | Frame: {frame_id}"
             
@@ -299,10 +421,11 @@ def main():
                 gt_pc_array = np.column_stack((gt_pc_x, gt_pc_y))
                 pred_pc_array = np.column_stack((pred_pc_x, pred_pc_y))
                 cd_val = compute_chamfer_distance_2d(gt_pc_array, pred_pc_array)
-                print(f"{title_info} -> alpha: {current_alpha}, Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}",flush=True)
-
-                tqdm.write(f"{title_info} -> alpha: {current_alpha}, Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}")
                 metrics_records.append({
+                    'Run': args.run_name,
+                    'Model': args.model,
+                    'Checkpoint': args.checkpoint_path,
+                    **model_profile,
                     'Alpha': current_alpha,
                     'Scene': scene_id,
                     'Frame': frame_id,
@@ -323,7 +446,7 @@ def main():
             unfolded = F.unfold(radar_energy_pad, kernel_size=os_win_size, padding=0)
             valid_cells = unfolded[:, train_mask, :]
             cfar_noise_mean, _ = torch.kthvalue(valid_cells, k_index, dim=1)
-            cfar_noise_mean = cfar_noise_mean.view(1, 1, 500, 240)
+            cfar_noise_mean = cfar_noise_mean.view_as(radar_energy_4d)
             cfar_pred = (radar_energy_4d > (cfar_alpha * cfar_noise_mean))
 
             # radar_energy_pad= F.pad(radar_energy_4d, (pad_cfar, pad_cfar, pad_cfar, pad_cfar), mode='replicate')    
@@ -340,8 +463,11 @@ def main():
             cfar_pred_pc_array = np.column_stack((cfar_pred_pc_x, cfar_pred_pc_y))  
 
             cfar_cd = compute_chamfer_distance_2d(gt_pc_array, cfar_pred_pc_array)
-            print(f"{title_info} -> CFAR (alpha={cfar_alpha}): Pd: {cfar_pd:.4f}, Pfa: {cfar_pfa:.6f}, Chamfer Dist: {cfar_cd:.4f}",flush=True)
             metrics_records.append({
+                'Run': args.run_name,
+                'Model': args.model,
+                'Checkpoint': args.checkpoint_path,
+                **model_profile,
                 'Alpha': f'CFAR_{cfar_alpha}',
                 'Scene': scene_id,
                 'Frame': frame_id,
@@ -350,6 +476,8 @@ def main():
                 'Chamfer_Dist': cfar_cd 
             })
 
+            if args.log_every and (batch_idx + 1) % args.log_every == 0:
+                print(f"[{args.run_name}] processed {batch_idx + 1}/{len(test_loader)} frames", flush=True)
             
 
     # ==============================
@@ -363,10 +491,18 @@ def main():
     
     avg_pd = df_metrics['Pd'].mean()
     avg_pfa = df_metrics['Pfa'].mean()
+    df_summary = df_metrics.groupby(
+        ['Run', 'Model', 'Checkpoint', 'Alpha'],
+        as_index=False,
+        sort=False
+    )[['Pd', 'Pfa', 'Chamfer_Dist',
+       'Profile_Params', 'Profile_MACs', 'Profile_FLOPs', 'Profile_PeakMemoryMB']].mean()
     
     # 保存 CSV
-    csv_path = os.path.join(args.output_dir, "502跑的Unet.csv")
+    csv_path = os.path.join(args.output_dir, args.csv_name)
+    summary_csv_path = os.path.join(args.output_dir, f"summary_{args.csv_name}")
     df_metrics.to_csv(csv_path, index=False)
+    df_summary.to_csv(summary_csv_path, index=False)
     
     # 保存 TXT Summary
     # txt_path = os.path.join(args.output_dir, "summary323.txt")
@@ -378,7 +514,11 @@ def main():
     #     f.write(f"Average Pfa: {avg_pfa:.6f}\n")
     #     f.write(f"Average Chamfer Distance: {avg_cd:.4f}\n")
         
-    print("\n✅ 推理和可视化全部完成！")
+    print("\n推理测试完成")
+    print(f"详细逐帧指标: {csv_path}")
+    print(f"按 Alpha 汇总指标: {summary_csv_path}")
+    print(f"平均 Pd: {avg_pd:.4f} | 平均 Pfa: {avg_pfa:.6f} | 平均 Chamfer Distance: {avg_cd:.4f}")
+    print(df_summary.to_string(index=False))
     # print(f"👉 可视化图片文件夹: {vis_dir}")
     # print(f"👉 详细指标数据: {csv_path}")
     # print(f"👉 平均性能总结: {txt_path}")

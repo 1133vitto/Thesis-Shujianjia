@@ -5,6 +5,7 @@
 import sys
 import os
 import datetime
+import shutil
 from pathlib import Path
 import torch.nn.functional as F
 current_dir = Path(__file__).resolve().parent
@@ -23,8 +24,9 @@ import torchvision.transforms.functional as TF
 import wandb
 
 
-from model import FastFusionModel, MaxPower2DModel, CustomUNet, CustomUNetPlusPlus, CustomUNet3Plus
-from losses import RadarFusionLoss
+from model import FastFusionModel, MaxPower2DModel, CustomUNet, CustomUNetPlusPlus, CustomUNet3Plus, CustomUNet2Layer, CustomUNet2Level, CustomUNet4Level
+from losses import RadarFusionLoss, AsymmetricTemperatureBottleneck
+from lidar_filtering import build_filtered_lidar_gt
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 
 try:
@@ -127,7 +129,22 @@ def main():
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=42, help='随机种子，确保结果可复现')
     parser.add_argument('--model', type=str, default='CustomUNetPlusPlus', help='选择模型类型')
-
+    parser.add_argument('--loss', type=str, default='RadarFusionLoss', help='选择损失函数')
+    parser.add_argument('--train_val_scenes', type=int, nargs='+', default=[1, 3, 4, 5, 7],
+                        help='用于训练和验证的 RaDelft scene 列表')
+    parser.add_argument('--test_scenes', type=int, nargs='+', default=[2, 6],
+                        help='保存在 params 中的测试 scene 列表')
+    parser.add_argument('--use_soft_target', action='store_true', default=False,
+                        help='使用高斯模糊 soft target')
+    parser.add_argument('--focal_loss_type', type=str, default='quality',
+                        choices=['quality', 'stable'],
+                        help='focal loss 类型: quality (连续) 或 stable (离散)')
+    parser.add_argument('--use_atb', action='store_true', default=False,
+                        help='训练 loss 前启用 AsymmetricTemperatureBottleneck')
+    parser.add_argument('--filter_lidar_gt', action='store_true',
+                        help='使用 z>2m 且 normalized SPAR<0.2 过滤后的 LiDAR GT')
+    parser.add_argument('--launch_script', type=str, default=None,
+                        help='提交本次训练的 shell 脚本路径，会复制到 checkpoint run 目录')
     args = parser.parse_args()
     
     wandb.init(project="model v1.0", name=args.name)
@@ -136,6 +153,9 @@ def main():
     print("启动2d训练")
     print(f" 运算设备: {args.device}")
     print(f" 数据模式: {'RaDelft 真实数据' if args.use_radelft else '模拟数据'}")
+    print(f" Train/Val scenes: {args.train_val_scenes}")
+    print(f" Test scenes: {args.test_scenes}")
+    print(f" LiDAR GT过滤: {'开启' if args.filter_lidar_gt else '关闭'}")
     print("="*70)
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"run_{current_time}"
@@ -143,6 +163,12 @@ def main():
     save_dir = os.path.join(args.save_dir, run_name) 
     os.makedirs(save_dir, exist_ok=True)
     print(f"本次训练的所有权重将保存在: {save_dir}")
+    with open(os.path.join(save_dir, "train_args.txt"), "w") as f:
+        f.write(" ".join(sys.argv) + "\n\n")
+        for key, value in sorted(vars(args).items()):
+            f.write(f"{key}: {value}\n")
+    if args.launch_script:
+        shutil.copy2(args.launch_script, os.path.join(save_dir, "launch_script.sh"))
     # os.makedirs(args.save_dir, exist_ok=True)
     
     #load the data
@@ -152,8 +178,8 @@ def main():
         from radelft.data_preparation import data_preparation
         params = data_preparation.get_default_params()
         params["dataset_path"] = '/scratch/shujianjia/dataset/'
-        params["train_val_scenes"] = [1,3,4,5,7]
-        params["test_scenes"] = [2,6]
+        params["train_val_scenes"] = args.train_val_scenes
+        params["test_scenes"] = args.test_scenes
         params["bev"] = True
         train_dataset = RaDelftWrapper(mode='train', params=params)
         val_dataset = RaDelftWrapper(mode='val', params=params)
@@ -173,6 +199,9 @@ def main():
     'CustomUNet': CustomUNet,
     'CustomUNetPlusPlus': CustomUNetPlusPlus,
     'CustomUNet3Plus': CustomUNet3Plus,
+    'CustomUNet2Layer': CustomUNet2Layer,
+    'CustomUNet2Level': CustomUNet2Level,
+    'CustomUNet4Level': CustomUNet4Level
     }
     model_class =MODEL_REGISTRY[args.model]
 
@@ -185,7 +214,9 @@ def main():
     # model.unet.freeze_backbone()
 
     # 3.  Loss
-    criterion = RadarFusionLoss(weight_focal=1.0, weight_dice=0,weight_cfar=0) # 先不考虑 quantile loss
+    criterion = RadarFusionLoss(weight_focal=1.0,
+                                focal_loss_type=args.focal_loss_type)
+    logit_modulator = AsymmetricTemperatureBottleneck() if args.use_atb else None
     
     # 4. optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4) # AdamW 比 Adam 更利于泛化
@@ -198,16 +229,17 @@ def main():
     # break to test validation loop
     step=0
 
-    kernel_size=[1, 5]
-    sigma=[0.1, 2.0]
-    dummy_point = torch.zeros(1, 1, 31, kernel_size[1])
-    dummy_point[0, 0, 15, kernel_size[1]//2] = 1.0
-    # 获取孤立单点模糊后的最大值 (比如 0.4)
-    W_c = TF.gaussian_blur(dummy_point, kernel_size=kernel_size, sigma=sigma).max()
+    if args.use_soft_target:
+        kernel_size=[1, 5]
+        sigma=[0.1, 2.0]
+        dummy_point = torch.zeros(1, 1, 31, kernel_size[1])
+        dummy_point[0, 0, 15, kernel_size[1]//2] = 1.0
+        W_c = TF.gaussian_blur(dummy_point, kernel_size=kernel_size, sigma=sigma).max()
     # 5. training loop
     for epoch in range(args.num_epochs):
         model.train()
         total_train_loss = 0.0
+        train_filter_stats = {"raw_points": 0, "dropped_points": 0}
         
         pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{args.num_epochs}] Train")
         
@@ -219,6 +251,15 @@ def main():
                 # collapse the height dimension by taking the maximum value across it, resulting in a 2D occupancy map
                 occupancy_target, _ = torch.max(occupancy_target, dim=1)
             occupancy_target=occupancy_target.to(args.device)
+            if args.filter_lidar_gt:
+                occupancy_target, filter_stats = build_filtered_lidar_gt(
+                    radar_cube=radar_cube,
+                    metadata=batch_data['metadata'],
+                    params=params,
+                    device=args.device,
+                )
+                train_filter_stats["raw_points"] += filter_stats["raw_points"]
+                train_filter_stats["dropped_points"] += filter_stats["dropped_points"]
             optimizer.zero_grad()
             
             # forward
@@ -228,25 +269,24 @@ def main():
             radar_energy = outputs['ra_energy'][:, :, :-12, 8:-8]#( B, 1, R, A  )
             # quantile_preds = outputs['quantiles'][..., :-12, 8:-8]
             # radar_energy = outputs['ra_energy'][..., :-12, 8:-8]
-            occupancy_target = occupancy_target.unsqueeze(1) #(B, 1, R, A)
-            # print(f"occupancy_target shape: {occupancy_target.shape}")
-            soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
-            scaled=soft_targets / W_c
-            soft_targets = torch.clamp(scaled, min=0, max=1.0)  # 将
-            final_targets = torch.max(occupancy_target, soft_targets)
-            # batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
-            # batch_max = batch_max.view(-1, 1, 1, 1)
-            # soft_targets_norm = soft_targets / (batch_max + 1e-8)
-            soft_targets = final_targets.squeeze(1) #(B, R, A)
+
+            if args.use_soft_target:
+                soft_targets = TF.gaussian_blur(occupancy_target.unsqueeze(1),
+                                                kernel_size=[1, 5], sigma=[0.1, 2.0])
+                scaled = soft_targets / W_c
+                soft_targets = torch.clamp(scaled, min=0, max=1.0)
+                final_targets = torch.max(occupancy_target.unsqueeze(1), soft_targets)
+                occupancy_target = final_targets.squeeze(1)
 
 
-
-
+            loss_logits = occupancy_logits
+            if logit_modulator is not None:
+                loss_logits = logit_modulator(loss_logits, occupancy_target)
 
             loss_dict = criterion(
-                occupancy_logits=occupancy_logits,
+                occupancy_logits=loss_logits,
                 # quantile_preds=quantile_preds,
-                occupancy_target=soft_targets,
+                occupancy_target=occupancy_target,
                 radar_energy=radar_energy
             )
             
@@ -278,6 +318,7 @@ def main():
         total_val_loss = 0.0
         pd_list = []
         pfa_list = []
+        val_filter_stats = {"raw_points": 0, "dropped_points": 0}
         count=0
         with torch.no_grad():
             for batch_data in val_loader:
@@ -288,6 +329,15 @@ def main():
                 occupancy_target_2d=occupancy_target.to(args.device)
                 # occupancy_target_3d=occupancy_target.to(args.device)
                 # occupancy_target = batch_data['occupancy_target'].to(args.device)
+                if args.filter_lidar_gt:
+                    occupancy_target_2d, filter_stats = build_filtered_lidar_gt(
+                        radar_cube=radar_cube,
+                        metadata=batch_data['metadata'],
+                        params=params,
+                        device=args.device,
+                    )
+                    val_filter_stats["raw_points"] += filter_stats["raw_points"]
+                    val_filter_stats["dropped_points"] += filter_stats["dropped_points"]
                 outputs = model(radar_cube)
                 
                 occupancy_logits = outputs['occupancy_logits'][:,  :-12, 8:-8]
@@ -298,26 +348,24 @@ def main():
 
                 radar_cube_real = radar_cube[:, :-12, :, 8:-8]
 
-                occupancy_target = occupancy_target_2d.unsqueeze(1) #(B, 1, R, A)
-                # print(f"occupancy_target shape: {occupancy_target.shape}")
-                soft_targets = TF.gaussian_blur(occupancy_target, kernel_size=[1, 5], sigma=[0.1, 2.0])
-                # batch_max = soft_targets.view(soft_targets.size(0), -1).max(dim=1).values
-                # batch_max = batch_max.view(-1, 1, 1, 1)
-                # soft_targets_norm = soft_targets / (batch_max + 1e-8)
-                scaled=soft_targets / W_c
-                soft_targets = torch.clamp(scaled, min=0, max=1.0)  # 将
-                final_targets = torch.max(occupancy_target, soft_targets)
-                soft_targets = final_targets.squeeze(1) #(B, R, A)
-                
-                
+                occupancy_target = occupancy_target_2d #(B, R, A)
 
+                if args.use_soft_target:
+                    soft_targets = TF.gaussian_blur(occupancy_target.unsqueeze(1),
+                                                    kernel_size=[1, 5], sigma=[0.1, 2.0])
+                    scaled = soft_targets / W_c
+                    soft_targets = torch.clamp(scaled, min=0, max=1.0)
+                    final_targets = torch.max(occupancy_target.unsqueeze(1), soft_targets)
+                    occupancy_target = final_targets.squeeze(1)
 
-
+                loss_logits = occupancy_logits
+                if logit_modulator is not None:
+                    loss_logits = logit_modulator(loss_logits, occupancy_target)
 
                 loss_dict = criterion(
-                occupancy_logits=occupancy_logits,
+                occupancy_logits=loss_logits,
                 # quantile_preds=quantile_preds,
-                occupancy_target=soft_targets,
+                occupancy_target=occupancy_target,
                 radar_energy=radar_energy
                 )
                 total_val_loss += loss_dict['total_loss'].item()
@@ -339,7 +387,7 @@ def main():
 
 
                 
-                final_pred_2d = final_pred_2d.squeeze()
+                final_pred_2d = final_pred_2d.squeeze(1)
                 # B, R, A = final_pred_2d.shape
                 max_doppler_idx=outputs['max_indices'][:, :-12, 8:-8] #(B, 500, 240)
                 # max_doppler_idx = torch.argmax(radar_cube_real, dim=2)#(B, 500, 240)
@@ -381,6 +429,12 @@ def main():
         # mean_qpfa = np.mean(qpfa_list)
         print(f"\n[Validation Result] -> Average Pd: {mean_pd:.4f} | Average Pfa: {mean_pfa:.4f}")
         print(f" Epoch [{epoch+1}] Summary | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        if args.filter_lidar_gt:
+            print(
+                f" Filtered LiDAR GT | "
+                f"train dropped {train_filter_stats['dropped_points']}/{train_filter_stats['raw_points']} raw points | "
+                f"val dropped {val_filter_stats['dropped_points']}/{val_filter_stats['raw_points']} raw points"
+            )
         
         wandb.log({
             "epoch": epoch + 1,  # 统一的 X 轴
@@ -388,7 +442,11 @@ def main():
             "Loss/Validation": avg_val_loss,
             "Metrics/Pd": mean_pd,
             "Metrics/Pfa": mean_pfa,
-            "Learning_Rate": optimizer.param_groups[0]['lr'] # 顺手记录一下学习率的变化！
+            "Learning_Rate": optimizer.param_groups[0]['lr'], # 顺手记录一下学习率的变化！
+            "FilteredGT/Train_Dropped_Points": train_filter_stats["dropped_points"],
+            "FilteredGT/Train_Raw_Points": train_filter_stats["raw_points"],
+            "FilteredGT/Validation_Dropped_Points": val_filter_stats["dropped_points"],
+            "FilteredGT/Validation_Raw_Points": val_filter_stats["raw_points"],
         })
 
 

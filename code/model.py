@@ -101,8 +101,8 @@ class old2DModel(nn.Module):
         logits = self.unet(x)  # raw logits
 
         return {
-            'occupancy_prob': torch.sigmoid(logits).squeeze(),  # (B, R, A) - probability for detection
-            'occupancy_logits': logits.squeeze(),              # (B, R, A) - raw logits for loss
+            'occupancy_prob': torch.sigmoid(logits).squeeze(1),  # (B, R, A) - probability for detection
+            'occupancy_logits': logits.squeeze(1),              # (B, R, A) - raw logits for loss
             'ra_energy': max_power,                           # (B, 1, R, A)
             'max_indices': max_indices                        # (B, R, A)
         }
@@ -153,8 +153,8 @@ class MaxPower2DModel(nn.Module):
         logits = self.unet(x)  # raw logits
 
         return {
-            'occupancy_prob': torch.sigmoid(logits).squeeze(),  # (B, R, A) - probability for detection
-            'occupancy_logits': logits.squeeze(),              # (B, R, A) - raw logits for loss
+            'occupancy_prob': torch.sigmoid(logits).squeeze(1),  # (B, R, A) - probability for detection
+            'occupancy_logits': logits.squeeze(1),              # (B, R, A) - raw logits for loss
             'ra_energy': max_power,                           # (B, 1, R, A)
             'max_indices': max_indices                        # (B, R, A)
         }
@@ -241,6 +241,84 @@ class CustomResNet18Encoder(nn.Module):
         features.append(x4)
         
         return features # 返回 5 个层级的特征字典 [x0_0, x1_0, x2_0, x3_0, x4_0]
+
+
+class CustomResNet18Encoder2Layer(nn.Module):
+    """ResNet18 truncated to 2 downsampling stages (H/8 bottleneck)."""
+    def __init__(self, in_channels=2, pretrained=True):
+        super().__init__()
+        base_model = torchvision.models.resnet18(pretrained=pretrained)
+
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        if pretrained:
+            with torch.no_grad():
+                self.conv1.weight.copy_(base_model.conv1.weight[:, :in_channels, :, :])
+
+        self.bn1 = base_model.bn1
+        self.relu = base_model.relu
+        self.maxpool = base_model.maxpool
+
+        self.layer1 = base_model.layer1
+        self.layer2 = base_model.layer2
+
+    def forward(self, x):
+        features = []
+        x0 = self.relu(self.bn1(self.conv1(x)))       # H/2, 64ch
+        features.append(x0)
+        x1 = self.layer1(self.maxpool(x0))            # H/4, 64ch
+        features.append(x1)
+        x2 = self.layer2(x1)                          # H/8, 128ch
+        features.append(x2)
+        return features  # [x0_0, x1_0, x2_0]
+
+
+class CustomResNet18Encoder2Level(nn.Module):
+    """ResNet18 truncated to 2 feature levels: H/2 and H/4."""
+    def __init__(self, in_channels=2, pretrained=True):
+        super().__init__()
+        base_model = torchvision.models.resnet18(pretrained=pretrained)
+
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        if pretrained:
+            with torch.no_grad():
+                self.conv1.weight.copy_(base_model.conv1.weight[:, :in_channels, :, :])
+
+        self.bn1 = base_model.bn1
+        self.relu = base_model.relu
+        self.maxpool = base_model.maxpool
+        self.layer1 = base_model.layer1
+
+    def forward(self, x):
+        x0 = self.relu(self.bn1(self.conv1(x)))       # H/2, 64ch
+        x1 = self.layer1(self.maxpool(x0))            # H/4, 64ch
+        return [x0, x1]
+
+
+class CustomResNet18Encoder4Level(nn.Module):
+    """ResNet18 truncated to 4 feature levels: H/2 through H/16."""
+    def __init__(self, in_channels=2, pretrained=True):
+        super().__init__()
+        base_model = torchvision.models.resnet18(pretrained=pretrained)
+
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        if pretrained:
+            with torch.no_grad():
+                self.conv1.weight.copy_(base_model.conv1.weight[:, :in_channels, :, :])
+
+        self.bn1 = base_model.bn1
+        self.relu = base_model.relu
+        self.maxpool = base_model.maxpool
+        self.layer1 = base_model.layer1
+        self.layer2 = base_model.layer2
+        self.layer3 = base_model.layer3
+
+    def forward(self, x):
+        x0 = self.relu(self.bn1(self.conv1(x)))       # H/2, 64ch
+        x1 = self.layer1(self.maxpool(x0))            # H/4, 64ch
+        x2 = self.layer2(x1)                          # H/8, 128ch
+        x3 = self.layer3(x2)                          # H/16, 256ch
+        return [x0, x1, x2, x3]
+
 
 class CustomUNetPlusPlus(nn.Module):
     def __init__(self, in_channels=2, classes=1):
@@ -341,6 +419,92 @@ class CustomUNet(nn.Module):
         
         return out
 
+
+
+class CustomUNet2Layer(nn.Module):
+    """
+    Lightweight 2-layer U-Net — only 2 down/up stages to fight overfitting.
+    Bottleneck at H/8 instead of H/32, params roughly halved.
+    """
+    def __init__(self, in_channels=2, classes=1):
+        super().__init__()
+        self.encoder = CustomResNet18Encoder2Layer(in_channels=in_channels, pretrained=True)
+
+        ch = [32, 64]
+
+        self.node_1 = DecoderNode(up_in_channels=128, skip_channels_list=[64], out_channels=ch[1])
+        self.node_0 = DecoderNode(up_in_channels=ch[1], skip_channels_list=[64], out_channels=ch[0])
+
+        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.final_conv = nn.Conv2d(ch[0], classes, kernel_size=1)
+
+    def forward(self, x):
+        features = self.encoder(x)
+        x0_0, x1_0, x2_0 = features[0], features[1], features[2]
+
+        d1 = self.node_1(up_x=x2_0, skip_xs=[x1_0])
+        d0 = self.node_0(up_x=d1,   skip_xs=[x0_0])
+
+        out = self.final_up(d0)
+        out = self.final_conv(out)
+
+        return out
+
+
+class CustomUNet2Level(nn.Module):
+    """
+    U-Net with 2 feature levels: H/2 and H/4.
+    """
+    def __init__(self, in_channels=2, classes=1):
+        super().__init__()
+        self.encoder = CustomResNet18Encoder2Level(in_channels=in_channels, pretrained=True)
+
+        ch = [32]
+
+        self.node_0 = DecoderNode(up_in_channels=64, skip_channels_list=[64], out_channels=ch[0])
+
+        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.final_conv = nn.Conv2d(ch[0], classes, kernel_size=1)
+
+    def forward(self, x):
+        x0_0, x1_0 = self.encoder(x)
+
+        d0 = self.node_0(up_x=x1_0, skip_xs=[x0_0])
+
+        out = self.final_up(d0)
+        out = self.final_conv(out)
+
+        return out
+
+
+class CustomUNet4Level(nn.Module):
+    """
+    U-Net with 4 feature levels: H/2, H/4, H/8, and H/16.
+    """
+    def __init__(self, in_channels=2, classes=1):
+        super().__init__()
+        self.encoder = CustomResNet18Encoder4Level(in_channels=in_channels, pretrained=True)
+
+        ch = [32, 64, 128]
+
+        self.node_2 = DecoderNode(up_in_channels=256, skip_channels_list=[128], out_channels=ch[2])
+        self.node_1 = DecoderNode(up_in_channels=ch[2], skip_channels_list=[64], out_channels=ch[1])
+        self.node_0 = DecoderNode(up_in_channels=ch[1], skip_channels_list=[64], out_channels=ch[0])
+
+        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.final_conv = nn.Conv2d(ch[0], classes, kernel_size=1)
+
+    def forward(self, x):
+        x0_0, x1_0, x2_0, x3_0 = self.encoder(x)
+
+        d2 = self.node_2(up_x=x3_0, skip_xs=[x2_0])
+        d1 = self.node_1(up_x=d2,   skip_xs=[x1_0])
+        d0 = self.node_0(up_x=d1,   skip_xs=[x0_0])
+
+        out = self.final_up(d0)
+        out = self.final_conv(out)
+
+        return out
 
 
 class Unet3ScaleConv(nn.Module):

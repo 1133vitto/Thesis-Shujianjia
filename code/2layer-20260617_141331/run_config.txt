@@ -1,0 +1,8 @@
+run_name: 2layer-20260617_141331
+model: CustomUNet2Layer
+checkpoint_path: checkpoints/run_20260617_141331/best_epoch_31_loss_0.0119.pth
+train_val_scenes: [1, 3, 4, 5, 7]
+test_scenes: [2, 6]
+alphas: [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.25, 4.5]
+device: cuda
+filter_lidar_gt: False

@@ -20,11 +20,33 @@ radelft_dir = current_dir / "radelft"
 sys.path.insert(0, str(radelft_dir)) 
 sys.path.insert(0, str(current_dir))
 
-from model import MaxPower2DModel, old2DModel, CustomUNet,CustomUNet3Plus, CustomUNetPlusPlus
+from model import MaxPower2DModel, old2DModel, CustomUNet,CustomUNet3Plus, CustomUNetPlusPlus, CustomUNet2Layer
 from radelft.loaders.rad_cube_loader import RADCUBE_DATASET
 from radelft.utils.compute_metrics import compute_pd_pfa
 from radelft.data_preparation import data_preparation
 from train2d import RaDelftWrapper
+
+def _metadata_value(metadata, key, default):
+    value = metadata.get(key, default)
+    if isinstance(value, (list, tuple)):
+        value = value[0]
+    if isinstance(value, torch.Tensor):
+        value = value.item()
+    return value
+
+def extract_scene_frame(metadata, fallback_index):
+    scene = _metadata_value(metadata, 'scene', f'unk_{fallback_index}')
+    frame = _metadata_value(metadata, 'frame', fallback_index)
+    power_path = str(_metadata_value(metadata, 'power_path', ''))
+
+    if "Scene" in power_path:
+        scene_part = power_path.split("Scene", 1)[1].split(os.sep, 1)[0]
+        scene = int(scene_part)
+    if "Pow_Frame_" in power_path:
+        frame = int(power_path.rsplit("Pow_Frame_", 1)[1].split(".", 1)[0])
+
+    return scene, frame
+
 # ==========================================
 # 辅助函数：计算 Chamfer Distance (2D)
 # ==========================================
@@ -128,12 +150,26 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./results')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--test_version', type=str, default='1.0')
+    parser.add_argument('--model', type=str, default='CustomUNet2Layer',
+                        choices=['CustomUNet', 'CustomUNetPlusPlus', 'CustomUNet2Layer', 'CustomUNet3Plus'])
+    parser.add_argument('--train_val_scenes', type=int, nargs='+', default=[1, 3, 4, 5, 7],
+                        help='保存在 params 中的训练/验证 scene 列表')
+    parser.add_argument('--test_scenes', type=int, nargs='+', default=[2, 6],
+                        help='用于可视化测试的 scene 列表')
+    parser.add_argument('--alpha', type=float, default=2.0)
     parser.add_argument('--max_frames', type=int, default=10,
                         help='Maximum frames to visualize')
+    parser.add_argument('--global_indices', type=int, nargs='+', default=None,
+                        help='0-based indices in the concatenated test dataset order')
+    parser.add_argument('--output_format', type=str, default='png', choices=['png', 'pdf'],
+                        help='Visualization output format')
+    parser.add_argument('--rasterize_points', action=argparse.BooleanOptionalAction, default=True,
+                        help='Rasterize point clouds in vector outputs to keep PDF files small')
     args = parser.parse_args()
     
     # 1. 创建输出目录
-    vis_dir = os.path.join(args.output_dir, '细分点云unet502')
+    vis_dir = args.output_dir
+    print(f"✅ 输出目录: {vis_dir}")
     os.makedirs(vis_dir, exist_ok=True)
     
     # Range Axis
@@ -169,21 +205,43 @@ def main():
     print("启动测试推理与可视化")
     print(f" 加载模型: {args.checkpoint_path}")
     print(f" 结果保存至: {args.output_dir}")
+    print(f" Train/Val scenes: {args.train_val_scenes}")
+    print(f" Test scenes: {args.test_scenes}")
     print("="*70)
 
     # 2. 准备数据集 (使用 batch_size=1 以便逐帧画图)
     params = data_preparation.get_default_params()
     params["dataset_path"] = '/scratch/shujianjia/dataset/'
-    params["train_val_scenes"] = [1, 3, 4, 5, 7]
-    params["test_scenes"] = [2, 6]  # 仅测试集
+    params["train_val_scenes"] = args.train_val_scenes
+    params["test_scenes"] = args.test_scenes  # 仅测试集
     params["bev"]=True
     
     test_dataset = RaDelftWrapper(mode='test', params=params) # 或者 mode='test' 看你的 dataloader 定义
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    if args.global_indices is not None:
+        total = len(test_dataset)
+        invalid = [idx for idx in args.global_indices if idx < 0 or idx >= total]
+        if invalid:
+            raise ValueError(
+                f"Global indices out of range 0..{total - 1} for test_scenes={args.test_scenes}: {invalid}"
+            )
+        selected_indices = args.global_indices[:args.max_frames]
+        test_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(test_dataset, selected_indices),
+            batch_size=1,
+            shuffle=False,
+        )
+    else:
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     # 3. 初始化模型并加载权重
     # model = old2DModel(in_channels=2).to(args.device)
-    model = MaxPower2DModel(model=CustomUNetPlusPlus,in_channels=2).to(args.device)
+    MODEL_REGISTRY = {
+        'CustomUNet': CustomUNet,
+        'CustomUNetPlusPlus': CustomUNetPlusPlus,
+        'CustomUNet2Layer': CustomUNet2Layer,
+        'CustomUNet3Plus': CustomUNet3Plus,
+    }
+    model = MaxPower2DModel(model=MODEL_REGISTRY[args.model],in_channels=2).to(args.device)
     
     # 解析字典并加载权重
     checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
@@ -222,9 +280,15 @@ def main():
             outputs = model(radar_cube)
             
             # 维度截取 (根据你验证集的代码逻辑)
-            occupancy_logits = outputs['occupancy_prob'].unsqueeze(0) # (B, 1, R, A)
+            occupancy_logits = outputs['occupancy_prob']
+            if occupancy_logits.dim() == 2:
+                occupancy_logits = occupancy_logits.unsqueeze(0)
+            elif occupancy_logits.dim() == 4 and occupancy_logits.size(1) == 1:
+                occupancy_logits = occupancy_logits.squeeze(1)
             occupancy_logits = occupancy_logits[:, :-12, 8:-8]
-            radar_energy = outputs['ra_energy'][:, :-12, 8:-8] if outputs['ra_energy'].dim() == 3 else outputs['ra_energy'][:, 0, :-12, 8:-8]
+
+            radar_energy = outputs['ra_energy']
+            radar_energy = radar_energy[:, :-12, 8:-8] if radar_energy.dim() == 3 else radar_energy[:, 0, :-12, 8:-8]
             
             occupancy_logits = occupancy_logits.unsqueeze(1) # (B, 1, R, A)
             radar_energy_4d = radar_energy.unsqueeze(1)      # (B, 1, R, A)
@@ -232,18 +296,16 @@ def main():
             # 计算 pred 和 bgenergy
             pred = 1.0 - occupancy_logits
 
+            alpha = args.alpha
             if args.test_version == '1.0':
                 bgenergy = pred * radar_energy_4d
                 
                 # 计算局部背景噪声
-                kernel_size = 7
+                kernel_size = 5
                 pad = kernel_size // 2
                 bgenergy = F.pad(bgenergy, (pad, pad, pad, pad), mode='replicate')
                 local_bg_noise_sum = F.avg_pool2d(bgenergy, kernel_size=kernel_size, stride=1, padding=0)
-                # 最终的二值化预测首先尝试了 TopK 的方式，替换了原来的逻辑。
-
-
-                alpha = 2.5
+                
                 final_pred_2d = radar_energy_4d > (alpha * local_bg_noise_sum)
                 bg_noise_np = local_bg_noise_sum.squeeze().cpu().numpy()
             
@@ -264,8 +326,6 @@ def main():
                 topk_energies = torch.gather(energy_unfold, dim=1, index=topk_indices)
                 local_bg_noise_unfold = topk_energies.mean(dim=1)  # 形状: (B, R * A)
                 local_bg_noise_mean = local_bg_noise_unfold.view(B, 1, R, A)
-
-                alpha = 1.5
                 final_pred_2d = radar_energy_4d > (alpha * local_bg_noise_mean)
                 # final_pred_2d = final_pred_2d.squeeze(1) # (B, R, A)
 
@@ -287,15 +347,16 @@ def main():
             cfar_pred_np = cfar_pred.squeeze().cpu().numpy().astype(np.float32)
             # 获取元数据信息用于命名
             meta = batch_data['metadata']
-            scene_id = meta.get('scene', [f'unk_{batch_idx}'])[0]
-            if isinstance(scene_id, torch.Tensor): scene_id = scene_id.item()
-            frame_id = meta.get('frame', [batch_idx])[0]
-            if isinstance(frame_id, torch.Tensor): frame_id = frame_id.item()
+            scene_id, frame_id = extract_scene_frame(meta, batch_idx)
 
             title_info = f"Scene: {scene_id} | Frame: {frame_id}"
-            save_path = os.path.join(vis_dir, f"scene_{scene_id}_frame_{frame_id}.png")
-            if os.path.exists(save_path):
-                continue# jump existing visualizations to save time
+            save_path = os.path.join(
+                vis_dir,
+                f"visual_alpha_{alpha}_scene_{scene_id}_frame_{frame_id}_bev.{args.output_format}",
+            )
+            # if os.path.exists(save_path):
+            #     print(f"跳过已存在文件: {save_path}")
+            #     continue# jump existing visualizations to save time
             # ==============================
             # 指标计算
             # ==============================
@@ -329,7 +390,7 @@ def main():
 
             gt_pc_array = np.column_stack((gt_pc_x, gt_pc_y))
             pred_pc_array = np.column_stack((pred_pc_x, pred_pc_y))
-            cd_val = compute_chamfer_distance(gt_pc_array, pred_pc_array)
+            cd_val = compute_chamfer_distance_2d(gt_pc_array, pred_pc_array)
             print(f"{title_info} -> Pd: {pd_val:.4f}, Pfa: {pfa_val:.6f}, Chamfer Dist: {cd_val:.4f}")
             metrics_records.append({
                 'Alpha': alpha,
@@ -343,13 +404,14 @@ def main():
             # 画图 (1行5列)
             # ==============================
             layout = [
-            ["camera", "camera", "camera", "radar_energy"],
-            ["cfar_pred", "bg_noise", "final_pred_pc", "gt_pc"],
-            ["tp_points", "fp_points", "fn_points", "combined"],
+            ["camera", "camera", "radar_energy"],
+            ["pred_prob",  "final_pred_pc", "gt_pc"],
+            # ["tp_points", "fp_points", "fn_points", "combined"],
             ]
 
-            fig, axd = plt.subplot_mosaic(layout, figsize=(20, 15), layout='constrained')
-            fig.suptitle(f"Test Set Evaluation - {title_info}", fontsize=18)
+            fig, axd = plt.subplot_mosaic(layout, figsize=(15, 8), layout='constrained')
+            proposed_metrics = f"Proposed method: Pd={pd_val:.4f}, Pfa={pfa_val:.6f}, CD={cd_val:.4f}"
+            fig.suptitle(f"{title_info}\n{proposed_metrics}", fontsize=18)
 
 
             # ==========================================
@@ -362,65 +424,73 @@ def main():
             img = np.fliplr(img)
             axd["camera"].imshow(img, aspect='auto')  # 这里用 auto 还是 0.9 取决于你的相机畸变
             axd["camera"].axis('off')
-            axd["camera"].set_title("Camera Reference")
+            axd["camera"].set_title("Camera Reference", fontsize=20)
         
 
             # 1. Radar Energy
             radar_energy_db = 10 * np.log10(radar_energy_np + 1e-9) + 39.54
             # 使用 pcolormesh 替代 imshow 渲染不规则网格
             im_re = axd["radar_energy"].pcolormesh(X, Y, radar_energy_db, cmap='jet', shading='gouraud')
-            axd["radar_energy"].set_title("Radar Energy (dB)")
+            im_re.set_rasterized(args.output_format == 'pdf')
+            axd["radar_energy"].set_title("Radar Energy (dB)",fontsize=20)
             plt.colorbar(im_re, ax=axd["radar_energy"], fraction=0.046, pad=0.04)
 
-            # # 2. Pred (Probability)
-            # im1 = axd["pred_prob"].pcolormesh(X, Y, pred_np, cmap='plasma', vmin=0, vmax=1, shading='auto')
-            # axd["pred_prob"].set_title("Pred (Probability)")
-            # plt.colorbar(im1, ax=axd["pred_prob"], fraction=0.046, pad=0.04)
+            # 2. Pred (Probability)
+            im1 = axd["pred_prob"].pcolormesh(X, Y, pred_np, cmap='plasma', vmin=0, vmax=1, shading='auto')
+            im1.set_rasterized(args.output_format == 'pdf')
+            axd["pred_prob"].set_title("Network output",fontsize=20)
+            plt.colorbar(im1, ax=axd["pred_prob"], fraction=0.046, pad=0.00001)
 
            # CFAR
             # axd["cfar_pred"].scatter(cfar_pc_x, cfar_pc_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
             # axd["cfar_pred"].set_title("CFAR Pred (Point Cloud)")
 
 
-            axd["cfar_pred"].scatter(nndirect_x, nndirect_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
-            axd["cfar_pred"].set_title("nndirect")
+            # axd["cfar_pred"].scatter(nndirect_x, nndirect_y, s=3, c='blue', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
+            # axd["cfar_pred"].set_title("nndirect")
 
 
 
 
             # 3. Local BG Noise Sum
-            if args.test_version == '1.0':
-                bg_noise_db = 10 * np.log10(bg_noise_np + 1e-9) + 39.54
-                im2 = axd["bg_noise"].pcolormesh(X, Y, bg_noise_db, cmap='jet', shading='gouraud')
-                axd["bg_noise"].set_title("Threshold")
-                plt.colorbar(im2, ax=axd["bg_noise"], fraction=0.046, pad=0.04)
+            # if args.test_version == '1.0':
+            #     bg_noise_db = 10 * np.log10(bg_noise_np + 1e-9) + 39.54
+            #     im2 = axd["bg_noise"].pcolormesh(X, Y, bg_noise_db, cmap='jet', shading='gouraud')
+            #     axd["bg_noise"].set_title("Threshold")
+            #     plt.colorbar(im2, ax=axd["bg_noise"], fraction=0.046, pad=0.04)
 
             # 4. Final Pred 2D
-            axd["final_pred_pc"].scatter(pred_pc_x, pred_pc_y, s=3, c='red', marker='o') # s=3 稍微放大一点防瞎眼，你可以改回1
-            axd["final_pred_pc"].set_title("Final Pred (Point Cloud)")
+            axd["final_pred_pc"].scatter(
+                pred_pc_x, pred_pc_y, s=3, c='red', marker='o',
+                rasterized=args.rasterize_points,
+            ) # s=3 稍微放大一点防瞎眼，你可以改回1
+            axd["final_pred_pc"].set_title(f"Proposed Method", fontsize=20)
 
             # 5. GT (Ground Truth)
-            axd["gt_pc"].scatter(gt_pc_x, gt_pc_y, s=3, c='green', marker='o')
-            axd["gt_pc"].set_title("Ground Truth (Point Cloud)")
+            axd["gt_pc"].scatter(
+                gt_pc_x, gt_pc_y, s=3, c='green', marker='o',
+                rasterized=args.rasterize_points,
+            )
+            axd["gt_pc"].set_title("Lidar point cloud", fontsize=20)
 
-            # 6. TP / FP / FN / Combined
-            axd["tp_points"].scatter(tp_x, tp_y, s=5, c='limegreen', marker='o', edgecolors='none')
-            axd["tp_points"].set_title(f"True Positives (n={len(tp_x)})")
+            # # 6. TP / FP / FN / Combined
+            # axd["tp_points"].scatter(tp_x, tp_y, s=5, c='limegreen', marker='o', edgecolors='none')
+            # axd["tp_points"].set_title(f"True Positives (n={len(tp_x)})")
 
-            axd["fp_points"].scatter(fp_x, fp_y, s=5, c='red', marker='o', edgecolors='none')
-            axd["fp_points"].set_title(f"False Positives (n={len(fp_x)})")
+            # axd["fp_points"].scatter(fp_x, fp_y, s=5, c='red', marker='o', edgecolors='none')
+            # axd["fp_points"].set_title(f"False Positives (n={len(fp_x)})")
 
-            axd["fn_points"].scatter(fn_x, fn_y, s=5, c='dodgerblue', marker='o', edgecolors='none')
-            axd["fn_points"].set_title(f"False Negatives (n={len(fn_x)})")
+            # axd["fn_points"].scatter(fn_x, fn_y, s=5, c='dodgerblue', marker='o', edgecolors='none')
+            # axd["fn_points"].set_title(f"False Negatives (n={len(fn_x)})")
 
-            axd["combined"].scatter(tp_x, tp_y, s=5, c='limegreen', marker='o', edgecolors='none', label='TP')
-            axd["combined"].scatter(fp_x, fp_y, s=5, c='red', marker='o', edgecolors='none', label='FP')
-            axd["combined"].scatter(fn_x, fn_y, s=5, c='dodgerblue', marker='o', edgecolors='none', label='FN')
-            axd["combined"].set_title(f"Combined (TP={len(tp_x)} / FP={len(fp_x)} / FN={len(fn_x)})")
+            # axd["combined"].scatter(tp_x, tp_y, s=5, c='limegreen', marker='o', edgecolors='none', label='TP')
+            # axd["combined"].scatter(fp_x, fp_y, s=5, c='red', marker='o', edgecolors='none', label='FP')
+            # axd["combined"].scatter(fn_x, fn_y, s=5, c='dodgerblue', marker='o', edgecolors='none', label='FN')
+            # axd["combined"].set_title(f"Combined (TP={len(tp_x)} / FP={len(fp_x)} / FN={len(fn_x)})")
 
             # 统一调整所有子图的坐标轴表现
-            for key in ["radar_energy", "cfar_pred", "bg_noise", "final_pred_pc", "gt_pc",
-                        "tp_points", "fp_points", "fn_points", "combined"]:
+            for key in ["radar_energy","pred_prob", "final_pred_pc", "gt_pc",]:
+                        # "tp_points", "fp_points", "fn_points", "combined"]:
                 axd[key].set_aspect('equal')
                 # 严格看齐你代码的横向视野 (-30m 到 30m)
                 axd[key].set_xlim(-30, 30)
@@ -434,8 +504,7 @@ def main():
             # plt.tight_layout()
 
             # 保存图片
-            save_path = os.path.join(vis_dir, f"alpha_{alpha}_frame_{frame_id}_bev.png")
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.savefig(save_path, dpi=150, bbox_inches='tight', format=args.output_format)
             plt.close(fig) # 防止内存泄漏
 
             step += 1
